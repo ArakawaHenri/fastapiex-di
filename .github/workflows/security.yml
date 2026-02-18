@@ -1,0 +1,34 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Validate lockfile
+        run: uv lock --check
+
+      - name: Run supply-chain checks
+        run: ./scripts/supply_chain_check.sh
