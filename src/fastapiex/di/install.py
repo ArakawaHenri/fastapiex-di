@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Sequence
 
 from fastapi import FastAPI
-from loguru import logger
 
 from .container import (
     ServiceContainer,
@@ -20,6 +20,8 @@ from .registry import (
     register_module_service_definitions,
     register_services_from_registry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

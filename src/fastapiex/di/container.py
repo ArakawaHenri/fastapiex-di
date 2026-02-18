@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import logging
 import os
 import threading
 import types
@@ -24,9 +25,10 @@ from typing import (
 )
 
 from fastapi.params import Depends
-from loguru import logger
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+logger = logging.getLogger(__name__)
 
 REQUEST_FAILED_STATE_KEY = "_svc_request_failed"
 _CURRENT_REQUEST_CTX: contextvars.ContextVar[HTTPConnection | None] = contextvars.ContextVar(

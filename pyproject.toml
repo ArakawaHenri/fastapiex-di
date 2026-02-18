@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "fastapiex-di"
-version = "1.0.0"
+version = "1.0.1"
 description = "DI extension for FastAPIEX"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -37,7 +37,6 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.110,<1.0",
-  "loguru>=0.7.0",
 ]
 
 [project.urls]

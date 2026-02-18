@@ -10,38 +10,6 @@ uv add fastapiex-di
 
 ## Quick Start
 
-```python
-from fastapi import FastAPI
-from fastapiex.di import BaseService, Inject, Service, install_di
-
-app = FastAPI()
-install_di(
-    app,
-    service_packages=["myapp.services"],
-)
-
-
-@Service("clock_service", eager=True)
-class ClockService(BaseService):
-    @classmethod
-    async def create(cls) -> "ClockService":
-        return cls()
-
-
-@app.get("/health")
-async def health(svc: ClockService = Inject("clock_service")):
-    return {"ok": isinstance(svc, ClockService)}
-```
-
-`install_di(...)` wires startup/shutdown lifecycle automatically.
-
-Important:
-
-- Keep service modules lazily imported by `install_di(...)` package scanning.
-- Avoid importing decorated service modules before `install_di(...)` runs.
-
-## Quickstart
-
 Use this exact structure from your project root:
 
 ```text
@@ -108,15 +76,12 @@ The registration capture window is opened during `install_di(...)` startup impor
 If decorated services are imported before that window, startup fails with:
 `No active app service registry capture`.
 
-Use a separate service module (for example `demo/services.py`) and point
-`service_packages` to that module path.
-
 ## Import Timing Rules
 
 | Do | Don't |
 | --- | --- |
-| `install_di(app, service_packages=["demo.services"])` | Put `@Service` classes in `main.py` and import them before startup |
-| Keep decorated services under a dedicated module/package | `from demo.services import PingService` in `demo/main.py` |
+| `install_di(app, service_packages=["demo.services"])` | `from demo.services import PingService` in `demo/main.py` |
+| Keep decorated services under a dedicated module/package | Put `@Service` classes in `main.py` |
 | Let DI scan import service modules during startup | Manually import decorated service modules in app bootstrap |
 
 ## Project Layout Contract
@@ -168,24 +133,68 @@ Guidelines:
 
 - Keep all `@Service` / `@ServiceDict` classes under one or more explicit packages (for example `app.services`).
 - Keep route handlers under `app.api.*`, and resolve dependencies via `Inject(...)` only.
-- Keep framework config (`settings`, logging, middleware wiring) under `app.core.*`.
+- Keep framework config (settings, logging, middleware wiring) under `app.core.*`.
 
 ## Service Registration
 
-### 1. Named service
+### Naming Conventions (Recommended)
+
+- Singleton services: use `Service` suffix (for example `UserRepoService`).
+- Transient services: use `ServiceT` suffix (for example `UserRepoServiceT`).
+- Generator/contextmanager-style services: use `ServiceG` suffix (for example `UserRepoServiceG`).
+
+### 1. Singleton + eager
 
 ```python
 from fastapiex.di import BaseService, Service
 
 
-@Service("user_service")
-class UserService(BaseService):
+@Service("app_config_service", eager=True)
+class AppConfigService(BaseService):
     @classmethod
-    async def create(cls) -> "UserService":
+    async def create(cls) -> "AppConfigService":
         return cls()
 ```
 
-### 2. Anonymous service (type-only)
+`eager=True` only applies to singleton services. Transient services cannot be eager.
+
+### 2. Transient service
+
+```python
+from fastapiex.di import BaseService, Service
+
+
+@Service("request_context_service_t", lifetime="transient")
+class RequestContextServiceT(BaseService):
+    @classmethod
+    async def create(cls) -> "RequestContextServiceT":
+        return cls()
+```
+
+### 3. `exposed_type` for type-based resolution
+
+```python
+from typing import Protocol
+
+from fastapiex.di import BaseService, Service
+
+
+class UserRepo(Protocol):
+    async def list_users(self) -> list[str]:
+        ...
+
+
+@Service("repo_service", exposed_type=UserRepo)
+class UserRepoService(BaseService):
+    @classmethod
+    async def create(cls) -> "UserRepoService":
+        return cls()
+
+    async def list_users(self) -> list[str]:
+        return ["alice", "bob"]
+```
+
+### 4. Anonymous service (type-only)
 
 ```python
 from fastapiex.di import BaseService, Service
@@ -196,13 +205,13 @@ class UserCache:
 
 
 @Service
-class UserCacheProvider(BaseService):
+class UserCacheService(BaseService):
     @classmethod
     async def create(cls) -> UserCache:
         return UserCache()
 ```
 
-### 3. ServiceDict expansion
+### 5. ServiceDict expansion
 
 ```python
 from fastapiex.di import BaseService, ServiceDict
@@ -220,27 +229,21 @@ class DatabaseService(BaseService):
 ## Declaring Service-to-Service Dependencies
 
 Use `require(...)` in `create(...)` defaults.
+The example below reuses `UserRepo` and `UserCache` defined above.
 
 ```python
 from fastapiex.di import BaseService, Service, require
 
 
-@Service("repo_service")
-class RepoService(BaseService):
+@Service("user_query_service_t", lifetime="transient")
+class UserQueryServiceT(BaseService):
     @classmethod
-    async def create(cls, db=require("main_db_service")) -> "RepoService":
-        _ = db
-        return cls()
-```
-
-You can also depend on type:
-
-```python
-@Service("consumer")
-class ConsumerService(BaseService):
-    @classmethod
-    async def create(cls, cache=require(UserCache)) -> "ConsumerService":
-        _ = cache
+    async def create(
+        cls,
+        repo=require(UserRepo),
+        cache=require(UserCache),
+    ) -> "UserQueryServiceT":
+        _ = repo, cache
         return cls()
 ```
 
@@ -252,17 +255,31 @@ class ConsumerService(BaseService):
 from fastapiex.di import Inject
 
 
-@app.get("/users")
-async def list_users(repo=Inject("repo_service")):
-    return {"ok": True}
+@app.get("/users/by-key")
+async def users_by_key(repo=Inject("repo_service")):
+    return {"users": await repo.list_users()}
 ```
 
 ### Type-based (only when exactly one provider exists)
 
 ```python
-@app.get("/cache")
-async def cache_state(cache: UserCache = Inject(UserCache)):
-    return {"ok": isinstance(cache, UserCache)}
+@app.get("/users/by-type")
+async def users_by_type(repo: UserRepo = Inject(UserRepo)):
+    return {"users": await repo.list_users()}
+```
+
+### Nested
+
+```python
+@app.get("/nested")
+async def nested(
+    query_service: UserQueryServiceT = Inject(
+        "user_query_service_t",
+        repo=Inject("repo_service"),
+        cache=Inject(UserCache),
+    ),
+):
+    return {"ok": isinstance(query_service, UserQueryServiceT)}
 ```
 
 ## Production Settings

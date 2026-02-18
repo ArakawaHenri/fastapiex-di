@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import importlib
 import inspect
+import logging
 import pkgutil
 import sys
 import threading
@@ -13,9 +14,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar, cast, overload
 
-from loguru import logger
-
 from .container import ServiceContainer, ServiceLifetime
+
+logger = logging.getLogger(__name__)
 
 Ctor = Callable[..., object]
 Dtor = Callable[[object], None | Awaitable[None]] | None
@@ -907,5 +908,5 @@ async def register_services_from_registry(
             )
         )
 
-    logger.debug("[LIFESPAN] Auto-registered services", count=len(plan))
+    logger.debug("[LIFESPAN] Auto-registered services count=%s", len(plan))
     return registered_services
