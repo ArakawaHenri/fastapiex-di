@@ -9,11 +9,7 @@ import threading
 import types
 import uuid
 import weakref
-from collections.abc import AsyncIterator as AsyncIteratorABC
-from collections.abc import Awaitable, Callable
-from collections.abc import Awaitable as AwaitableABC
-from collections.abc import Coroutine as CoroutineABC
-from collections.abc import Iterator as IteratorABC
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from enum import IntEnum
 from typing import (
     Annotated,
@@ -43,11 +39,11 @@ _CURRENT_REQUEST_CTX: contextvars.ContextVar[HTTPConnection | None] = contextvar
 # - an asynchronous contextmanager-style factory via AsyncIterator[object]
 Ctor = Callable[
     ...,
-    object | Awaitable[object] | IteratorABC[object] | AsyncIteratorABC[object],
+    object | Awaitable[object] | Iterator[object] | AsyncIterator[object],
 ]
 
-# Destructor (dtor): takes an instance object, may be sync or async
-Dtor = Callable[[object], None | Awaitable[None]] | None
+# Destructor (dtor): takes an instance object and must be async
+Dtor = Callable[[object], Awaitable[None]] | None
 
 
 class ServiceLifetime(IntEnum):
@@ -385,7 +381,7 @@ class ServiceContainer:
         if origin is not None:
             try:
                 is_contextmanager_annotation = issubclass(
-                    origin, (AsyncIteratorABC, IteratorABC)
+                    origin, (AsyncIterator, Iterator)
                 )
             except TypeError:
                 is_contextmanager_annotation = False
@@ -404,7 +400,7 @@ class ServiceContainer:
             return None
 
         # Awaitable[T]
-        if origin is AwaitableABC:
+        if origin is Awaitable:
             args = get_args(ann)
             if args:
                 inner_type = args[0]
@@ -422,7 +418,7 @@ class ServiceContainer:
                 return cast(object, inner_type)
 
         # Coroutine[Any, Any, T]
-        if origin is CoroutineABC:
+        if origin is Coroutine:
             args = get_args(ann)
             if len(args) == 3:
                 inner_type = args[2]
@@ -550,19 +546,15 @@ class ServiceContainer:
 
     @staticmethod
     def _make_async_finalizer(
-            dtor: Callable[[object], object | Awaitable[object]],
+            dtor: Callable[[object], Awaitable[None]],
             instance: object,
     ) -> Callable[[], Awaitable[None]]:
         """
         Wrap a destructor into an async callable that can be awaited.
-
-        The destructor itself may be synchronous or return an awaitable.
         """
 
         async def _finalizer() -> None:
-            result = dtor(instance)
-            if inspect.isawaitable(result):
-                await result
+            await dtor(instance)
 
         return _finalizer
 
@@ -574,6 +566,13 @@ class ServiceContainer:
             msg = (
                 f"Invalid destructor for service key={key!r}: "
                 f"expected a callable or None, got {type(dtor)!r}."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+        if not inspect.iscoroutinefunction(dtor):
+            msg = (
+                f"Invalid destructor for service key={key!r}: "
+                "destructor must be defined as async def."
             )
             logger.error(msg)
             raise TypeError(msg)
@@ -785,10 +784,6 @@ class ServiceContainer:
     # Public API                                                            #
     # --------------------------------------------------------------------- #
 
-    @property
-    def registrations_frozen(self) -> bool:
-        return self._registrations_frozen
-
     def freeze_registrations(self) -> None:
         """
         Freeze runtime registration updates on this container.
@@ -798,15 +793,6 @@ class ServiceContainer:
         """
         self._ensure_event_loop()
         self._registrations_frozen = True
-
-    def unfreeze_registrations(self) -> None:
-        """
-        Allow runtime registration updates again.
-
-        This is primarily intended for tests and controlled dev tooling.
-        """
-        self._ensure_event_loop()
-        self._registrations_frozen = False
 
     async def register(
             self,
@@ -1071,29 +1057,6 @@ class ServiceContainer:
                 self.destructing = False
                 logger.debug("Finished destruction of all singleton services.")
 
-    def require(
-        self,
-        key: str,
-        *,
-        allow_transient: bool = False,
-    ) -> Callable[..., Awaitable[object]]:
-        """
-        Declare a dependency on another registered service by key.
-
-        Returns a lazy async lambda that resolves the service when awaited.
-        This is intended for wiring dependencies between services themselves,
-        not for FastAPI endpoint resolution.
-        """
-        service = self._get_service_by_key(key)
-        if not allow_transient and isinstance(service, ServiceContainer.TransientService):
-            raise RuntimeError(
-                f"Service '{key}' is transient. "
-                "Singletons should not depend on transient services "
-                "(set allow_transient=True to override)."
-            )
-
-        return lambda *a, **kw: self.aget_by_key(key, *a, **kw)
-
 
 class ServiceContainerRegistry:
     """
@@ -1295,13 +1258,13 @@ def Inject(
         # Reconstruct positional arguments.
         final_args = [
             resolved_deps[pos_dep_map[i]
-            ] if i in pos_dep_map else pos_static[i]
+                          ] if i in pos_dep_map else pos_static[i]
             for i in range(len(args))
         ]
         # Reconstruct keyword arguments.
         final_kwargs = {
             k: resolved_deps[kw_dep_map[k]
-            ] if k in kw_dep_map else kw_static[k]
+                             ] if k in kw_dep_map else kw_static[k]
             for k in kwargs
         }
 

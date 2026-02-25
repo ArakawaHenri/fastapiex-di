@@ -11,15 +11,21 @@ import threading
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Literal, Protocol, TypeVar, cast, overload
+from dataclasses import dataclass, field
+from typing import (
+    Literal,
+    Protocol,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from .container import ServiceContainer, ServiceLifetime
 
 logger = logging.getLogger(__name__)
 
 Ctor = Callable[..., object]
-Dtor = Callable[[object], None | Awaitable[None]] | None
+Dtor = Callable[[object], Awaitable[None]] | None
 _DEFAULT_DESTROY_MARKER = "__service_default_destroy_noop__"
 _SERVICE_DEFINITION_ATTR = "__fastapi_di_definition__"
 LifetimeLike = ServiceLifetime | int | Literal[
@@ -31,14 +37,16 @@ LifetimeLike = ServiceLifetime | int | Literal[
 ExpandedDefinition = tuple[
     "_ServiceDefinition",
     str | None,
+    tuple[object, ...],
     dict[str, object],
-    dict[str, "RequiredService"],
+    dict[str, "RequiredDependency"],
     inspect.Signature,
 ]
 ResolvedByInternalId = tuple[
     "_ServiceDefinition",
-    dict[str, "RequiredService"],
+    dict[str, "RequiredDependency"],
     inspect.Signature,
+    tuple[object, ...],
     dict[str, object],
     object,
     str | None,
@@ -46,6 +54,7 @@ ResolvedByInternalId = tuple[
 ResolvedSpec = tuple[
     "_ServiceDefinition",
     inspect.Signature,
+    tuple[object, ...],
     dict[str, object],
     tuple["_ResolvedDependency", ...],
     object,
@@ -61,15 +70,37 @@ class _CallableWithSignature(Protocol):
 @dataclass(frozen=True)
 class RequiredService:
     target: str | type[object]
+    args: tuple[object, ...] = ()
+    kwargs: dict[str, object] = field(default_factory=dict)
     allow_transient: bool = False
 
     def render_for_dict_key(self, dict_key: str) -> RequiredService:
-        if isinstance(self.target, str) and "{}" in self.target:
-            return RequiredService(
-                target=self.target.replace("{}", str(dict_key)),
-                allow_transient=self.allow_transient,
-            )
-        return self
+        def _render(value: object) -> object:
+            if isinstance(value, str) and "{}" in value:
+                return value.replace("{}", str(dict_key))
+            return value
+
+        rendered_target = _render(self.target)
+        rendered_args = tuple(_render(arg) for arg in self.args)
+        rendered_kwargs = {
+            key: _render(value)
+            for key, value in self.kwargs.items()
+        }
+        if (
+            rendered_target == self.target
+            and rendered_args == self.args
+            and rendered_kwargs == self.kwargs
+        ):
+            return self
+        return RequiredService(
+            target=cast(str | type[object], rendered_target),
+            args=rendered_args,
+            kwargs=rendered_kwargs,
+            allow_transient=self.allow_transient,
+        )
+
+
+RequiredDependency = RequiredService
 
 
 @dataclass(frozen=True)
@@ -81,7 +112,7 @@ class _ServiceDefinition:
     eager: bool
     ctor: Ctor
     dtor: Dtor
-    dependencies: dict[str, RequiredService]
+    dependencies: dict[str, RequiredDependency]
     source: Mapping[str, object] | Callable[[], Mapping[str, object]] | None = None
     exposed_type: object | None = None
 
@@ -89,8 +120,7 @@ class _ServiceDefinition:
 @dataclass(frozen=True)
 class _ResolvedDependency:
     param_name: str
-    dep_key: str | None
-    dep_type: type[object] | None
+    required: RequiredDependency
 
 
 @dataclass(frozen=True)
@@ -103,6 +133,7 @@ class _CompiledService:
     ctor: Ctor
     dtor: Dtor
     signature: inspect.Signature
+    static_args: tuple[object, ...]
     static_kwargs: dict[str, object]
     dependencies: tuple[_ResolvedDependency, ...]
     service_type: object
@@ -163,16 +194,6 @@ class AppServiceRegistry:
         with self._lock:
             self._frozen = False
 
-    def is_frozen(self) -> bool:
-        with self._lock:
-            return self._frozen
-
-    def clear_for_tests(self) -> None:
-        with self._lock:
-            self._definitions_by_origin.clear()
-            self._definition_order.clear()
-            self._frozen = False
-
 
 @dataclass(frozen=True)
 class _RegistrationCapture:
@@ -184,23 +205,31 @@ _ACTIVE_REGISTRATION_CAPTURE: contextvars.ContextVar[_RegistrationCapture | None
     contextvars.ContextVar("_svc_active_registration_capture", default=None)
 )
 
+
 def _register_definition_into_active_registry(definition: _ServiceDefinition) -> None:
     capture = _ACTIVE_REGISTRATION_CAPTURE.get()
     if capture is None:
-        raise RuntimeError(
-            "No active app service registry capture. "
-            "Decorated services must be imported during install_di() startup."
-        )
+        return
     include = capture.include_packages
     if include is not None and not _is_origin_included(definition.origin, include):
         return
     capture.registry.register(definition)
 
 
-def require(target: str | type[object], *, allow_transient: bool = False) -> RequiredService:
+def Require(
+    target: str | type[object],
+    *args: object,
+    allow_transient: bool = False,
+    **kwargs: object,
+) -> RequiredService:
     if not isinstance(target, (str, type)):
-        raise TypeError("require() expects a service key (str) or a service type")
-    return RequiredService(target=target, allow_transient=allow_transient)
+        raise TypeError("Require() expects a service key (str) or a service type")
+    return RequiredService(
+        target=target,
+        args=tuple(args),
+        kwargs=dict(kwargs),
+        allow_transient=allow_transient,
+    )
 
 
 def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
@@ -256,12 +285,17 @@ def _extract_ctors(service_cls: type[object]) -> tuple[Ctor, Dtor]:
     dtor = getattr(service_cls, "destroy", None)
     if dtor is None or not callable(dtor):
         raise TypeError(f"{service_cls!r}.destroy must be callable.")
+    if not inspect.iscoroutinefunction(dtor):
+        raise TypeError(
+            f"{service_cls!r}.destroy must be an async @classmethod."
+        )
     return ctor, dtor
 
 
-def _extract_dependencies(ctor: Ctor) -> dict[str, RequiredService]:
-    deps: dict[str, RequiredService] = {}
+def _extract_dependencies(ctor: Ctor) -> dict[str, RequiredDependency]:
+    deps: dict[str, RequiredDependency] = {}
     sig = inspect.signature(ctor)
+
     for name, parameter in sig.parameters.items():
         default = parameter.default
         if isinstance(default, RequiredService):
@@ -288,7 +322,7 @@ def _register_service_class(
         )
     if source is not None and key is None:
         raise ValueError(
-            f"ServiceDict '{service_cls.__name__}' requires a non-empty key template."
+            f"ServiceMap '{service_cls.__name__}' requires a non-empty key template."
         )
     definition = _ServiceDefinition(
         origin=f"{service_cls.__module__}.{service_cls.__qualname__}",
@@ -372,10 +406,10 @@ def Service(
     return _decorator
 
 
-def ServiceDict(
+def ServiceMap(
     key: str,
     *,
-    dict: Mapping[str, object] | Callable[[], Mapping[str, object]],
+    mapping: Mapping[str, object] | Callable[[], Mapping[str, object]],
     lifetime: LifetimeLike = ServiceLifetime.SINGLETON,
     eager: bool = False,
     exposed_type: object | None = None,
@@ -384,7 +418,7 @@ def ServiceDict(
         return _register_service_class(
             service_cls,
             key=key,
-            source=dict,
+            source=mapping,
             lifetime=lifetime,
             eager=eager,
             exposed_type=exposed_type,
@@ -472,28 +506,84 @@ def _coerce_mapping_value(
     *,
     signature: inspect.Signature,
     dependency_params: set[str],
-) -> dict[str, object]:
+) -> tuple[tuple[object, ...], dict[str, object]]:
     if hasattr(value, "model_dump") and callable(value.model_dump):
         raw = value.model_dump()
         if not isinstance(raw, Mapping):
             raise TypeError("model_dump() must return a mapping")
-        return dict(raw)
+        mapping_kwargs = dict(raw)
+        _validate_mapping_kwargs(signature=signature, mapping_kwargs=mapping_kwargs)
+        return (), mapping_kwargs
 
     if isinstance(value, Mapping):
-        return dict(value)
+        mapping_kwargs = dict(value)
+        _validate_mapping_kwargs(signature=signature, mapping_kwargs=mapping_kwargs)
+        return (), mapping_kwargs
 
+    # For scalar shorthand values we only accept deterministic bindings:
+    # 1) Prefer keyword-capable parameters to avoid positional drift.
+    # 2) Fallback to positional-only only when it is the first positional slot.
+    keyword_target: str | None = None
     for name, parameter in signature.parameters.items():
         if name in dependency_params:
             continue
-        if parameter.kind not in (
-            inspect.Parameter.POSITIONAL_ONLY,
+        if parameter.kind in (
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             inspect.Parameter.KEYWORD_ONLY,
         ):
-            continue
-        return {name: value}
+            keyword_target = name
+            break
+    if keyword_target is not None:
+        return (), {keyword_target: value}
 
-    raise TypeError("Unable to map ServiceDict value to ctor parameters")
+    positional_target: inspect.Parameter | None = None
+    for name, parameter in signature.parameters.items():
+        if name in dependency_params:
+            continue
+        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+            positional_target = parameter
+            break
+    if positional_target is None:
+        raise TypeError("Unable to map ServiceMap value to ctor parameters")
+
+    positional_slots = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    target_index = next(
+        index
+        for index, parameter in enumerate(positional_slots)
+        if parameter.name == positional_target.name
+    )
+    if target_index != 0:
+        raise TypeError(
+            "Scalar ServiceMap value cannot bind positional-only parameter "
+            f"'{positional_target.name}' because earlier positional parameters exist. "
+            "Use mapping={...} for explicit binding."
+        )
+    return (value,), {}
+
+
+def _validate_mapping_kwargs(
+    *,
+    signature: inspect.Signature,
+    mapping_kwargs: Mapping[str, object],
+) -> None:
+    positional_only = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind == inspect.Parameter.POSITIONAL_ONLY
+    }
+    for name in mapping_kwargs:
+        if name in positional_only:
+            raise TypeError(
+                "ServiceMap mapping cannot pass positional-only "
+                f"parameter '{name}' by key."
+            )
 
 
 def _resolve_source(
@@ -501,7 +591,7 @@ def _resolve_source(
 ) -> Mapping[str, object]:
     resolved = source() if callable(source) else source
     if not isinstance(resolved, Mapping):
-        raise TypeError("ServiceDict source must resolve to a mapping")
+        raise TypeError("ServiceMap source must resolve to a mapping")
     return resolved
 
 
@@ -531,14 +621,6 @@ def capture_service_registrations(
         _ACTIVE_REGISTRATION_CAPTURE.reset(token)
 
 
-def create_app_service_registry(
-    *,
-    include_packages: Sequence[str] | None = None,
-) -> AppServiceRegistry:
-    _ = include_packages
-    return AppServiceRegistry()
-
-
 def _expand_definitions(
     *,
     registry: AppServiceRegistry,
@@ -556,7 +638,16 @@ def _expand_definitions(
         dependency_params = set(definition.dependencies.keys())
 
         if definition.source is None:
-            expanded.append((definition, definition.key_template, {}, definition.dependencies, signature))
+            expanded.append(
+                (
+                    definition,
+                    definition.key_template,
+                    (),
+                    {},
+                    definition.dependencies,
+                    signature,
+                )
+            )
             continue
 
         if definition.key_template is None:
@@ -568,16 +659,35 @@ def _expand_definitions(
         for raw_dict_key, raw_value in source_mapping.items():
             dict_key = str(raw_dict_key)
             service_key = _render_service_key(definition.key_template, dict_key)
-            static_kwargs = _coerce_mapping_value(
+            static_args, static_kwargs = _coerce_mapping_value(
                 raw_value,
                 signature=signature,
                 dependency_params=dependency_params,
             )
+            static_bound: inspect.BoundArguments
+            try:
+                static_bound = signature.bind_partial(*static_args, **static_kwargs)
+            except TypeError as exc:
+                raise TypeError(
+                    f"Invalid ServiceMap mapping value for key '{service_key}' in "
+                    f"'{definition.origin}': {exc}"
+                ) from exc
+            overridden_params = set(static_bound.arguments.keys())
             deps = {
                 param_name: dep.render_for_dict_key(dict_key)
                 for param_name, dep in definition.dependencies.items()
+                if param_name not in overridden_params
             }
-            expanded.append((definition, service_key, static_kwargs, deps, signature))
+            expanded.append(
+                (
+                    definition,
+                    service_key,
+                    static_args,
+                    static_kwargs,
+                    deps,
+                    signature,
+                )
+            )
 
     return expanded
 
@@ -590,7 +700,7 @@ def _resolve_dependency_targets(
     type_index: dict[object, list[str]] = defaultdict(list)
 
     anon_seq = 0
-    for definition, key, static_kwargs, deps, signature in compiled:
+    for definition, key, static_args, static_kwargs, deps, signature in compiled:
         if key is not None:
             existing_internal_id = public_key_index.get(key)
             if existing_internal_id is not None:
@@ -613,6 +723,7 @@ def _resolve_dependency_targets(
             definition,
             deps,
             signature,
+            static_args,
             static_kwargs,
             service_type,
             key,
@@ -623,13 +734,14 @@ def _resolve_dependency_targets(
     resolved: dict[str, ResolvedSpec] = {}
 
     def _service_label(internal_id: str) -> str:
-        definition, _, _, _, _, registration_key = by_internal_id[internal_id]
+        definition, _, _, _, _, _, registration_key = by_internal_id[internal_id]
         return registration_key or definition.origin
 
     for internal_id, (
         definition,
         deps,
         signature,
+        static_args,
         static_kwargs,
         _service_type,
         registration_key,
@@ -649,8 +761,7 @@ def _resolve_dependency_targets(
                 resolved_deps.append(
                     _ResolvedDependency(
                         param_name=param_name,
-                        dep_key=dep_key,
-                        dep_type=None,
+                        required=dep,
                     )
                 )
             else:
@@ -670,13 +781,12 @@ def _resolve_dependency_targets(
                 resolved_deps.append(
                     _ResolvedDependency(
                         param_name=param_name,
-                        dep_key=None,
-                        dep_type=dep.target,
+                        required=dep,
                     )
                 )
 
             target_definition = by_internal_id[dep_internal_id][0]
-            target_key = by_internal_id[dep_internal_id][5]
+            target_key = by_internal_id[dep_internal_id][6]
             target_label = target_key or target_definition.origin
             if (
                 definition.lifetime == ServiceLifetime.SINGLETON
@@ -685,7 +795,7 @@ def _resolve_dependency_targets(
             ):
                 raise RuntimeError(
                     f"Singleton service '{service_label}' depends on transient service '{target_label}'. "
-                    "Use require(..., allow_transient=True) only if this is intentional."
+                    "Use Require(..., allow_transient=True) only if this is intentional."
                 )
 
             dep_internal_ids.add(dep_internal_id)
@@ -694,9 +804,10 @@ def _resolve_dependency_targets(
         resolved[internal_id] = (
             definition,
             signature,
+            static_args,
             static_kwargs,
             tuple(resolved_deps),
-            by_internal_id[internal_id][4],
+            by_internal_id[internal_id][5],
             registration_key,
         )
 
@@ -707,6 +818,7 @@ def _resolve_dependency_targets(
         (
             definition,
             signature,
+            static_args,
             static_kwargs,
             resolved_dependencies,
             service_type,
@@ -722,6 +834,7 @@ def _resolve_dependency_targets(
                 ctor=definition.ctor,
                 dtor=definition.dtor,
                 signature=signature,
+                static_args=static_args,
                 static_kwargs=static_kwargs,
                 dependencies=resolved_dependencies,
                 service_type=service_type,
@@ -803,50 +916,221 @@ def build_service_plan(
 ) -> list[_CompiledService]:
     include = tuple(include_packages) if include_packages is not None else None
     expanded = _expand_definitions(registry=registry, include_packages=include)
-    return _resolve_dependency_targets(expanded)
+    compiled = _resolve_dependency_targets(expanded)
+    _validate_singleton_specs(compiled)
+    return compiled
+
+
+def _validate_singleton_specs(specs: Sequence[_CompiledService]) -> None:
+    for spec in specs:
+        if spec.lifetime != ServiceLifetime.SINGLETON:
+            continue
+        dependency_defaults = {
+            dependency.param_name: dependency.required
+            for dependency in spec.dependencies
+        }
+        service_label = spec.key or spec.origin
+        try:
+            _compose_ctor_call_arguments(
+                signature=spec.signature,
+                dependency_defaults=dependency_defaults,
+                static_args=spec.static_args,
+                static_kwargs=spec.static_kwargs,
+                runtime_args=(),
+                runtime_kwargs={},
+                service_label=service_label,
+            )
+        except TypeError as exc:
+            raise TypeError(
+                f"Invalid singleton service '{service_label}': {exc}"
+            ) from exc
+
+
+def _compose_ctor_call_arguments(
+    *,
+    signature: inspect.Signature,
+    dependency_defaults: Mapping[str, RequiredDependency],
+    static_args: tuple[object, ...],
+    static_kwargs: Mapping[str, object],
+    runtime_args: tuple[object, ...],
+    runtime_kwargs: Mapping[str, object],
+    service_label: str,
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    parameter_map = signature.parameters
+    positional_params: list[inspect.Parameter] = []
+    kw_only_params: list[inspect.Parameter] = []
+    has_var_keyword = False
+    has_var_positional = False
+
+    for parameter in signature.parameters.values():
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_params.append(parameter)
+        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            kw_only_params.append(parameter)
+        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            has_var_positional = True
+        elif parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            has_var_keyword = True
+
+    base_bound = signature.bind_partial(*static_args, **dict(static_kwargs))
+
+    values: dict[str, object] = {}
+    var_positional_values: list[object] = []
+    var_keyword_values: dict[str, object] = {}
+    for name, value in base_bound.arguments.items():
+        parameter = parameter_map[name]
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            var_positional_values.extend(cast(tuple[object, ...], value))
+            continue
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            var_keyword_values.update(cast(dict[str, object], value))
+            continue
+        values[name] = value
+
+    unresolved_required_positional = [
+        parameter.name
+        for parameter in positional_params
+        if parameter.name not in values
+        and parameter.name not in dependency_defaults
+        and parameter.default is inspect.Parameter.empty
+    ]
+
+    runtime_positional_values = list(runtime_args)
+    runtime_positional_assigned: set[str] = set()
+    for param_name in unresolved_required_positional:
+        if not runtime_positional_values:
+            break
+        values[param_name] = runtime_positional_values.pop(0)
+        runtime_positional_assigned.add(param_name)
+
+    if runtime_positional_values:
+        if not has_var_positional:
+            raise TypeError(
+                f"Service '{service_label}' received too many positional arguments."
+            )
+        var_positional_values.extend(runtime_positional_values)
+
+    for key, value in runtime_kwargs.items():
+        runtime_param = parameter_map.get(key)
+        if runtime_param is None:
+            if not has_var_keyword:
+                raise TypeError(
+                    f"Service '{service_label}' got an unexpected keyword argument '{key}'."
+                )
+            var_keyword_values[key] = value
+            continue
+        if runtime_param.kind == inspect.Parameter.POSITIONAL_ONLY:
+            raise TypeError(
+                f"Service '{service_label}' positional-only parameter '{key}' passed as keyword."
+            )
+        if runtime_param.kind == inspect.Parameter.VAR_POSITIONAL:
+            raise TypeError(
+                f"Service '{service_label}' invalid keyword argument for *{key}."
+            )
+        if key in runtime_positional_assigned:
+            raise TypeError(
+                f"Service '{service_label}' got multiple values for argument '{key}'."
+            )
+        if runtime_param.kind == inspect.Parameter.VAR_KEYWORD:
+            var_keyword_values[key] = value
+            continue
+        values[key] = value
+
+    for parameter in (*positional_params, *kw_only_params):
+        if parameter.name in values:
+            continue
+        dependency_default = dependency_defaults.get(parameter.name)
+        if dependency_default is not None:
+            values[parameter.name] = dependency_default
+            continue
+        if parameter.default is not inspect.Parameter.empty:
+            values[parameter.name] = parameter.default
+            continue
+        if parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            raise TypeError(
+                f"Service '{service_label}' missing required keyword-only argument '{parameter.name}'."
+            )
+        raise TypeError(
+            f"Service '{service_label}' missing required argument '{parameter.name}'."
+        )
+
+    final_args = [values[parameter.name] for parameter in positional_params]
+    if has_var_positional:
+        final_args.extend(var_positional_values)
+    final_kwargs = {
+        parameter.name: values[parameter.name]
+        for parameter in kw_only_params
+        if parameter.name in values
+    }
+    if has_var_keyword:
+        final_kwargs.update(var_keyword_values)
+
+    return tuple(final_args), final_kwargs
+
+
+async def _resolve_required_service_value(
+    *,
+    container: ServiceContainer,
+    request: object,
+    value: object,
+) -> object:
+    if not isinstance(value, RequiredService):
+        return value
+
+    dep_kwargs = dict(value.kwargs)
+    if request is not None:
+        dep_kwargs[container.request_kwarg_name()] = request
+    if isinstance(value.target, str):
+        return await container.aget_by_key(value.target, *value.args, **dep_kwargs)
+    return await container.aget_by_type(value.target, *value.args, **dep_kwargs)
 
 
 def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Ctor:
     ctor = spec.ctor
     signature = spec.signature.replace(return_annotation=spec.service_type)
+    dependency_defaults = {
+        dependency.param_name: dependency.required
+        for dependency in spec.dependencies
+    }
+    service_label = spec.key or spec.origin
 
     async def _bound_ctor(*args: object, **kwargs: object) -> object:
-        provided_names: set[str] = set()
-        try:
-            provided_names = set(signature.bind_partial(*args, **kwargs).arguments)
-        except TypeError:
-            # Defer detailed signature errors to the original ctor call.
-            provided_names = set()
-
-        call_kwargs = dict(spec.static_kwargs)
-        for name in provided_names:
-            call_kwargs.pop(name, None)
-        call_kwargs.update(kwargs)
-
+        final_args, final_kwargs = _compose_ctor_call_arguments(
+            signature=signature,
+            dependency_defaults=dependency_defaults,
+            static_args=spec.static_args,
+            static_kwargs=spec.static_kwargs,
+            runtime_args=args,
+            runtime_kwargs=kwargs,
+            service_label=service_label,
+        )
         request = container.current_request()
-        request_kwarg_name = container.request_kwarg_name()
-
-        for dep in spec.dependencies:
-            if dep.param_name in provided_names or dep.param_name in call_kwargs:
-                continue
-            dep_kwargs: dict[str, object] = {}
-            if request is not None:
-                dep_kwargs[request_kwarg_name] = request
-            if dep.dep_key is not None:
-                call_kwargs[dep.param_name] = await container.aget_by_key(dep.dep_key, **dep_kwargs)
-            else:
-                if dep.dep_type is None:  # pragma: no cover - defensive
-                    raise RuntimeError(
-                        f"Invalid dependency spec for parameter '{dep.param_name}': missing key and type."
-                    )
-                call_kwargs[dep.param_name] = await container.aget_by_type(dep.dep_type, **dep_kwargs)
+        resolved_args = [
+            await _resolve_required_service_value(
+                container=container,
+                request=request,
+                value=value,
+            )
+            for value in final_args
+        ]
+        resolved_kwargs = {
+            key: await _resolve_required_service_value(
+                container=container,
+                request=request,
+                value=value,
+            )
+            for key, value in final_kwargs.items()
+        }
 
         if inspect.iscoroutinefunction(ctor):
-            return await ctor(*args, **call_kwargs)
+            return await ctor(*resolved_args, **resolved_kwargs)
         if inspect.isasyncgenfunction(ctor):
-            return ctor(*args, **call_kwargs)
+            return ctor(*resolved_args, **resolved_kwargs)
 
-        result = await asyncio.to_thread(ctor, *args, **call_kwargs)
+        result = await asyncio.to_thread(ctor, *resolved_args, **resolved_kwargs)
         if inspect.isawaitable(result):
             result = await result
         return result

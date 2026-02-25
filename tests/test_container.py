@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
 from starlette.requests import Request
 
-from fastapiex.di import (
+from fastapiex.di import Inject, Require, ServiceLifetime
+from fastapiex.di.container import (
     REQUEST_FAILED_STATE_KEY,
     ServiceContainer,
     ServiceContainerRegistry,
-    ServiceLifetime,
     get_or_create_service_container_registry,
     resolve_service_container,
 )
@@ -38,6 +40,36 @@ async def test_singleton_lifecycle():
     assert instance1 is instance2
     assert call_count == 1
     assert instance1["instance"] == 1
+
+
+@pytest.mark.asyncio
+async def test_singleton_ignores_runtime_args_on_first_resolution(caplog) -> None:
+    container = ServiceContainer()
+
+    async def factory(value: int = 1) -> dict[str, int]:
+        return {"value": value}
+
+    await container.register("singleton_with_default", ServiceLifetime.SINGLETON, factory, None)
+
+    with caplog.at_level(logging.WARNING):
+        first = cast(
+            dict[str, int],
+            await container.aget_by_key("singleton_with_default", 99),
+        )
+        second = cast(
+            dict[str, int],
+            await container.aget_by_key("singleton_with_default", value=7),
+        )
+
+    assert first is second
+    assert first["value"] == 1
+    ignored_messages = [
+        rec.message
+        for rec in caplog.records
+        if "Arguments given for singleton service 'singleton_with_default' are ignored." in rec.message
+    ]
+    assert len(ignored_messages) == 2
+
 
 
 @pytest.mark.asyncio
@@ -229,6 +261,25 @@ async def test_register_rejects_destructor_without_instance_param():
 
 
 @pytest.mark.asyncio
+async def test_register_rejects_sync_destructor():
+    container = ServiceContainer()
+
+    async def factory() -> dict[str, str]:
+        return {"ok": "1"}
+
+    def sync_destructor(instance: object) -> None:
+        _ = instance
+
+    with pytest.raises(TypeError, match="must be defined as async def"):
+        await container.register(
+            "bad_sync_dtor",
+            ServiceLifetime.SINGLETON,
+            factory,
+            cast(Any, sync_destructor),
+        )
+
+
+@pytest.mark.asyncio
 async def test_key_based_injection():
     """Test key-based service injection"""
     container = ServiceContainer()
@@ -240,6 +291,122 @@ async def test_key_based_injection():
 
     instance = cast(dict[str, str], await container.aget_by_key("my_service"))
     assert instance["message"] == "Hello from service"
+
+
+@pytest.mark.asyncio
+async def test_inject_passthrough_does_not_resolve_require_default_for_singleton() -> None:
+    container = ServiceContainer()
+
+    class Consumer:
+        def __init__(self, repo: object) -> None:
+            self.repo = repo
+
+    async def consumer_factory(repo=Require("repo")) -> Consumer:
+        return Consumer(repo)
+
+    await container.register("consumer", ServiceLifetime.SINGLETON, consumer_factory, None)
+
+    app = FastAPI()
+    registry = get_or_create_service_container_registry(app.state)
+    registry.register_current(container)
+    try:
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "path": "/",
+                "raw_path": b"/",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "state": {},
+                "app": app,
+            }
+        )
+
+        depends_marker = Inject("consumer")
+        dependency = depends_marker.dependency
+        assert dependency is not None
+        consumer = await dependency(request)
+        from fastapiex.di.registry import RequiredService
+
+        assert isinstance(consumer, Consumer)
+        assert isinstance(consumer.repo, RequiredService)
+        assert consumer.repo.target == "repo"
+    finally:
+        registry.unregister_current(expected=container)
+
+
+@pytest.mark.asyncio
+async def test_aget_passthrough_does_not_resolve_require_defaults() -> None:
+    container = ServiceContainer()
+
+    class Consumer:
+        def __init__(self, repo: object) -> None:
+            self.repo = repo
+
+    async def consumer_factory(repo=Require("repo")) -> Consumer:
+        return Consumer(repo)
+
+    await container.register("consumer", ServiceLifetime.SINGLETON, consumer_factory, None)
+
+    consumer = await container.aget_by_key("consumer")
+    from fastapiex.di.registry import RequiredService
+
+    assert isinstance(consumer, Consumer)
+    assert isinstance(consumer.repo, RequiredService)
+
+
+@pytest.mark.asyncio
+async def test_inject_passthrough_does_not_resolve_positional_only_require_default() -> None:
+    container = ServiceContainer()
+
+    class Consumer:
+        def __init__(self, repo: object) -> None:
+            self.repo = repo
+
+    async def consumer_factory(repo=Require("repo"), /) -> Consumer:
+        return Consumer(repo)
+
+    await container.register("consumer", ServiceLifetime.SINGLETON, consumer_factory, None)
+
+    app = FastAPI()
+    registry = get_or_create_service_container_registry(app.state)
+    registry.register_current(container)
+    try:
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "path": "/",
+                "raw_path": b"/",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "state": {},
+                "app": app,
+            }
+        )
+
+        depends_marker = Inject("consumer")
+        dependency = depends_marker.dependency
+        assert dependency is not None
+        consumer = await dependency(request)
+        from fastapiex.di.registry import RequiredService
+
+        assert isinstance(consumer, Consumer)
+        assert isinstance(consumer.repo, RequiredService)
+        assert consumer.repo.target == "repo"
+    finally:
+        registry.unregister_current(expected=container)
 
 
 @pytest.mark.asyncio

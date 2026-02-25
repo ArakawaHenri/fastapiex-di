@@ -3,9 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from .registry import Service, ServiceDict, require
-
-_DEFAULT_DESTROY_MARKER = "__service_default_destroy_noop__"
+from .registry import _DEFAULT_DESTROY_MARKER, Require, Service, ServiceMap
 
 
 class BaseService(ABC):
@@ -31,4 +29,4 @@ class BaseService(ABC):
     setattr(destroy, _DEFAULT_DESTROY_MARKER, True)
 
 
-__all__ = ["BaseService", "Service", "ServiceDict", "require"]
+__all__ = ["BaseService", "Require", "Service", "ServiceMap"]

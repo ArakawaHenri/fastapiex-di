@@ -1,24 +1,26 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import cast
 
 import pytest
 
 from fastapiex.di import (
-    AppServiceRegistry,
     BaseService,
-    RegisteredService,
+    Require,
     Service,
-    ServiceContainer,
-    ServiceDict,
     ServiceLifetime,
+    ServiceMap,
+)
+from fastapiex.di.container import ServiceContainer
+from fastapiex.di.registry import (
+    AppServiceRegistry,
+    RegisteredService,
+    _topological_registration_order,
     build_service_plan,
     capture_service_registrations,
-    create_app_service_registry,
     register_services_from_registry,
-    require,
 )
-from fastapiex.di.registry import _topological_registration_order
 
 
 @contextmanager
@@ -27,22 +29,17 @@ def _capture_here(registry: AppServiceRegistry):
         yield
 
 
-def test_service_registration_requires_active_capture() -> None:
-    with pytest.raises(RuntimeError, match="No active app service registry capture"):
-        @Service("outside_capture")
-        class OutsideCaptureService(BaseService):
-            @classmethod
-            async def create(cls) -> OutsideCaptureService:
-                return cls()
+def test_service_registration_outside_capture_is_allowed() -> None:
+    @Service("outside_capture")
+    class OutsideCaptureService(BaseService):
+        @classmethod
+        async def create(cls) -> OutsideCaptureService:
+            return cls()
+
+    assert OutsideCaptureService.__name__ == "OutsideCaptureService"
 
 
-def test_create_app_service_registry_returns_empty_registry() -> None:
-    registry = create_app_service_registry()
-    assert isinstance(registry, AppServiceRegistry)
-    assert registry.definitions() == []
-
-
-def test_service_dict_expansion_and_require_placeholder_resolution() -> None:
+def test_service_map_expansion_and_require_template_resolution() -> None:
     registry = AppServiceRegistry()
     with _capture_here(registry):
         @Service("shared_dep")
@@ -51,20 +48,20 @@ def test_service_dict_expansion_and_require_placeholder_resolution() -> None:
             async def create(cls) -> SharedDepService:
                 return cls()
 
-        @ServiceDict("root_service", dict={"alpha": {"name": "a"}, "beta": {"name": "b"}})
+        @ServiceMap("root_service", mapping={"alpha": {"name": "a"}, "beta": {"name": "b"}})
         class RootService(BaseService):
             @classmethod
             async def create(cls, name: str) -> RootService:
                 _ = name
                 return cls()
 
-        @ServiceDict("{}_child_service", dict={"alpha": {}, "beta": {}})
+        @ServiceMap("{}_child_service", mapping={"alpha": {}, "beta": {}})
         class ChildService(BaseService):
             @classmethod
             async def create(
                 cls,
-                shared=require("shared_dep"),
-                scoped=require("{}_root_service"),
+                shared=Require("shared_dep"),
+                scoped=Require("{}_root_service"),
             ) -> ChildService:
                 _ = shared, scoped
                 return cls()
@@ -78,16 +75,58 @@ def test_service_dict_expansion_and_require_placeholder_resolution() -> None:
     assert "beta_child_service" in by_key
 
     alpha_deps = {
-        dep.param_name: dep.dep_key for dep in by_key["alpha_child_service"].dependencies
+        dep.param_name: dep.required.target
+        for dep in by_key["alpha_child_service"].dependencies
     }
     beta_deps = {
-        dep.param_name: dep.dep_key for dep in by_key["beta_child_service"].dependencies
+        dep.param_name: dep.required.target
+        for dep in by_key["beta_child_service"].dependencies
     }
 
     assert alpha_deps["shared"] == "shared_dep"
     assert beta_deps["shared"] == "shared_dep"
     assert alpha_deps["scoped"] == "alpha_root_service"
     assert beta_deps["scoped"] == "beta_root_service"
+
+
+@pytest.mark.asyncio
+async def test_service_map_scalar_value_supports_positional_only_ctor_param() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @ServiceMap("{}_scalar", mapping={"alpha": "a", "beta": "b"})
+        class ScalarService(BaseService):
+            value: str
+
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            @classmethod
+            async def create(cls, value: str, /) -> ScalarService:
+                return cls(value)
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+
+    alpha = await container.aget_by_key("alpha_scalar")
+    beta = await container.aget_by_key("beta_scalar")
+    assert isinstance(alpha, ScalarService)
+    assert isinstance(beta, ScalarService)
+    assert alpha.value == "a"
+    assert beta.value == "b"
+
+
+def test_service_map_rejects_positional_only_param_in_mapping_dict() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @ServiceMap("scalar", mapping={"alpha": {"value": "x"}})
+        class BadScalarService(BaseService):
+            @classmethod
+            async def create(cls, value: str, /) -> BadScalarService:
+                _ = value
+                return cls()
+
+    with pytest.raises(TypeError, match="positional-only"):
+        build_service_plan(registry=registry)
 
 
 def test_app_scoped_registry_freeze_isolated() -> None:
@@ -99,13 +138,13 @@ def test_app_scoped_registry_freeze_isolated() -> None:
             async def create(cls) -> ScopedService:
                 return cls()
 
-    assert registry.is_frozen() is False
+    assert registry._frozen is False
     registry.freeze()
-    assert registry.is_frozen() is True
+    assert registry._frozen is True
 
     # Another app registry stays unaffected.
     another = AppServiceRegistry()
-    assert another.is_frozen() is False
+    assert another._frozen is False
 
 
 def test_capture_service_registrations_collects_into_app_registry() -> None:
@@ -121,7 +160,8 @@ def test_capture_service_registrations_collects_into_app_registry() -> None:
             async def create(cls) -> CapturedService:
                 return cls()
 
-    scoped_keys = {definition.key_template for definition in scoped_registry.definitions()}
+    scoped_keys = {
+        definition.key_template for definition in scoped_registry.definitions()}
     assert "captured_service" in scoped_keys
 
 
@@ -254,7 +294,8 @@ async def test_service_decorator_supports_anonymous_registration_defaults() -> N
     assert len(registered) == 2
     assert all(isinstance(item, RegisteredService) for item in registered)
     assert all(item.key is None for item in registered)
-    assert all(item.origin.endswith(("AnonymousServiceA", "AnonymousServiceB")) for item in registered)
+    assert all(item.origin.endswith(("AnonymousServiceA", "AnonymousServiceB"))
+               for item in registered)
 
     a1 = await container.aget_by_type(AnonymousPayloadA)
     a2 = await container.aget_by_type(AnonymousPayloadA)
@@ -287,7 +328,7 @@ async def test_named_service_can_depend_on_anonymous_service_by_type() -> None:
                 self.shared = shared
 
             @classmethod
-            async def create(cls, shared=require(SharedPayload)) -> ConsumerService:
+            async def create(cls, shared=Require(SharedPayload)) -> ConsumerService:
                 return cls(shared)
 
     container = ServiceContainer()
@@ -297,6 +338,53 @@ async def test_named_service_can_depend_on_anonymous_service_by_type() -> None:
     shared = await container.aget_by_type(SharedPayload)
     assert isinstance(consumer, ConsumerService)
     assert consumer.shared is shared
+
+
+@pytest.mark.asyncio
+async def test_positional_only_required_dependency_is_injected_positionally() -> None:
+    class SharedPayload:
+        pass
+
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("dep_service")
+        class DepService(BaseService):
+            @classmethod
+            async def create(cls) -> SharedPayload:
+                return SharedPayload()
+
+        @Service("consumer")
+        class ConsumerService(BaseService):
+            shared: SharedPayload
+
+            def __init__(self, shared: SharedPayload) -> None:
+                self.shared = shared
+
+            @classmethod
+            async def create(cls, shared=Require("dep_service"), /) -> ConsumerService:
+                return cls(shared)
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+
+    consumer = await container.aget_by_key("consumer")
+    shared = await container.aget_by_key("dep_service")
+    assert isinstance(consumer, ConsumerService)
+    assert consumer.shared is shared
+
+
+def test_service_destroy_must_be_async_classmethod() -> None:
+    with pytest.raises(TypeError, match="destroy must be an async @classmethod"):
+        @Service("bad_destroy")
+        class BadDestroyService(BaseService):
+            @classmethod
+            async def create(cls) -> BadDestroyService:
+                return cls()
+
+            @classmethod
+            def destroy(cls, instance: object) -> None:
+                _ = cls
+                _ = instance
 
 
 @pytest.mark.asyncio
@@ -373,9 +461,267 @@ def test_require_string_key_cannot_target_anonymous_service() -> None:
         @Service("consumer")
         class ConsumerByKey(BaseService):
             @classmethod
-            async def create(cls, dep=require("anonymous_only")) -> ConsumerByKey:
+            async def create(cls, dep=Require("anonymous_only")) -> ConsumerByKey:
                 _ = dep
                 return cls()
 
     with pytest.raises(RuntimeError, match="depends on 'anonymous_only'"):
         build_service_plan(registry=registry)
+
+
+@pytest.mark.asyncio
+async def test_transient_service_call_composition_prefers_defaulted_params() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("flexible_transient", lifetime=ServiceLifetime.TRANSIENT)
+        class FlexibleTransientService(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                one: int,
+                two: int = 2,
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, int, tuple[object, ...], dict[str, object]]:
+                _ = cls
+                return one, two, args, dict(kwargs)
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+
+    with pytest.raises(TypeError, match="missing required argument 'one'"):
+        await container.aget_by_key("flexible_transient")
+
+    by_kw = await container.aget_by_key("flexible_transient", one=1)
+    by_pos = await container.aget_by_key("flexible_transient", 1)
+    by_pos_with_extra = await container.aget_by_key("flexible_transient", 1, 3)
+    by_kw_extra = await container.aget_by_key("flexible_transient", 1, three=3)
+    by_kw_only_extra = await container.aget_by_key(
+        "flexible_transient",
+        one=1,
+        three=3,
+    )
+
+    assert by_kw == (1, 2, (), {})
+    assert by_pos == (1, 2, (), {})
+    assert by_pos_with_extra == (1, 2, (3,), {})
+    assert by_kw_extra == (1, 2, (), {"three": 3})
+    assert by_kw_only_extra == (1, 2, (), {"three": 3})
+
+
+@pytest.mark.asyncio
+async def test_require_supports_args_and_kwargs_when_resolving_dependency() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("arg_dep", lifetime=ServiceLifetime.TRANSIENT)
+        class ArgDepService(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                one: int,
+                two: int = 2,
+                *args: object,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                _ = cls
+                return {
+                    "one": one,
+                    "two": two,
+                    "args": args,
+                    "kwargs": dict(kwargs),
+                }
+
+        @Service("consumer_with_arg_dep", lifetime=ServiceLifetime.TRANSIENT)
+        class ConsumerWithArgDep(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                dep=Require("arg_dep", 1, 3, three=3),
+            ) -> object:
+                _ = cls
+                return dep
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+
+    payload = await container.aget_by_key("consumer_with_arg_dep")
+    assert payload == {
+        "one": 1,
+        "two": 2,
+        "args": (3,),
+        "kwargs": {"three": 3},
+    }
+
+
+def test_servicemap_explicit_value_overrides_require_dependency_edge() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @ServiceMap("{}_consumer", mapping={"alpha": {"repo": "from_map"}})
+        class ConsumerByMap(BaseService):
+            @classmethod
+            async def create(cls, repo=Require("missing_repo")) -> object:
+                _ = cls
+                return repo
+
+    plan = build_service_plan(registry=registry)
+    by_key = {spec.key: spec for spec in plan}
+    consumer_spec = by_key["alpha_consumer"]
+    assert consumer_spec.dependencies == ()
+
+
+@pytest.mark.asyncio
+async def test_singleton_missing_required_params_fails_during_registration() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("bad_singleton")
+        class BadSingleton(BaseService):
+            @classmethod
+            async def create(cls, one: int) -> BadSingleton:
+                _ = one
+                return cls()
+
+    container = ServiceContainer()
+    with pytest.raises(TypeError, match="Invalid singleton service 'bad_singleton'.*missing required argument 'one'"):
+        await register_services_from_registry(container, registry=registry)
+
+
+def test_servicemap_scalar_rejects_ambiguous_positional_binding_with_dependency_prefix() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @ServiceMap("{}_bad", mapping={"alpha": "v"})
+        class BadScalarMapService(BaseService):
+            @classmethod
+            async def create(cls, dep=Require("dep"), value: str = "default", /) -> object:
+                _ = cls, dep, value
+                return object()
+
+    with pytest.raises(TypeError, match="Scalar ServiceMap value cannot bind positional-only parameter"):
+        build_service_plan(registry=registry)
+
+
+@pytest.mark.asyncio
+async def test_servicemap_scalar_prefers_keyword_target_and_keeps_require_dependency() -> None:
+    class DepPayload:
+        pass
+
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("dep")
+        class DepService(BaseService):
+            @classmethod
+            async def create(cls) -> DepPayload:
+                _ = cls
+                return DepPayload()
+
+        @ServiceMap("{}_consumer", mapping={"alpha": "from_map"})
+        class ConsumerService(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                dep=Require("dep"),
+                value: str = "default",
+            ) -> dict[str, object]:
+                _ = cls
+                return {"dep": dep, "value": value}
+
+    plan = build_service_plan(registry=registry)
+    by_key = {spec.key: spec for spec in plan}
+    consumer_spec = by_key["alpha_consumer"]
+    dep_names = {dep.param_name for dep in consumer_spec.dependencies}
+    assert dep_names == {"dep"}
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+    payload = await container.aget_by_key("alpha_consumer")
+    payload = cast(dict[str, object], payload)
+    assert payload["value"] == "from_map"
+    assert isinstance(payload["dep"], DepPayload)
+
+
+@pytest.mark.asyncio
+async def test_require_template_renders_target_and_args_kwargs_for_servicemap() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @ServiceMap("{}_dep", mapping={"alpha": {"name": "dep-a"}, "beta": {"name": "dep-b"}})
+        class NamedDep(BaseService):
+            @classmethod
+            async def create(cls, name: str) -> dict[str, str]:
+                _ = cls
+                return {"name": name}
+
+        @ServiceMap("{}_formatter", mapping={"alpha": {}, "beta": {}}, lifetime=ServiceLifetime.TRANSIENT)
+        class FormatterService(BaseService):
+            @classmethod
+            async def create(cls, prefix: str, suffix: str = "") -> str:
+                _ = cls
+                return f"{prefix}{suffix}"
+
+        @ServiceMap("{}_consumer", mapping={"alpha": {}, "beta": {}}, lifetime=ServiceLifetime.TRANSIENT)
+        class ConsumerService(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                dep=Require("{}_dep"),
+                label=Require("{}_formatter", "{}", suffix="-ok"),
+            ) -> dict[str, object]:
+                _ = cls
+                return {"dep": dep, "label": label}
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+    alpha = cast(dict[str, object], await container.aget_by_key("alpha_consumer"))
+    beta = cast(dict[str, object], await container.aget_by_key("beta_consumer"))
+
+    alpha_dep = cast(dict[str, str], alpha["dep"])
+    beta_dep = cast(dict[str, str], beta["dep"])
+    assert alpha_dep["name"] == "dep-a"
+    assert beta_dep["name"] == "dep-b"
+    assert alpha["label"] == "alpha-ok"
+    assert beta["label"] == "beta-ok"
+
+
+@pytest.mark.asyncio
+async def test_singleton_missing_required_keyword_only_param_fails_during_registration() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("bad_singleton_kw")
+        class BadSingletonKeywordOnly(BaseService):
+            @classmethod
+            async def create(cls, *, config: str) -> BadSingletonKeywordOnly:
+                _ = config
+                return cls()
+
+    container = ServiceContainer()
+    with pytest.raises(
+        TypeError,
+        match="Invalid singleton service 'bad_singleton_kw'.*missing required keyword-only argument 'config'",
+    ):
+        await register_services_from_registry(container, registry=registry)
+
+
+@pytest.mark.asyncio
+async def test_transient_positional_args_do_not_override_require_default() -> None:
+    registry = AppServiceRegistry()
+    with _capture_here(registry):
+        @Service("dep")
+        class DepService(BaseService):
+            @classmethod
+            async def create(cls) -> str:
+                _ = cls
+                return "dep"
+
+        @Service("collector", lifetime=ServiceLifetime.TRANSIENT)
+        class CollectorService(BaseService):
+            @classmethod
+            async def create(
+                cls,
+                dep=Require("dep"),
+                *args: object,
+            ) -> tuple[str, tuple[object, ...]]:
+                _ = cls
+                return cast(str, dep), args
+
+    container = ServiceContainer()
+    await register_services_from_registry(container, registry=registry)
+    payload = await container.aget_by_key("collector", 1, 2)
+    assert payload == ("dep", (1, 2))

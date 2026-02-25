@@ -1,6 +1,6 @@
 # fastapiex-di
 
-Production-ready FastAPI extension for service registry and dependency injection.
+DI extension for FastAPIEx: Production-ready FastAPI extension for service registry and dependency injection.
 
 ## Installation
 
@@ -71,7 +71,7 @@ Notes:
 
 ## Why Not Single-File
 
-`@Service` and `@ServiceDict` run at import time.
+`@Service` and `@ServiceMap` run at import time.
 The registration capture window is opened during `install_di(...)` startup import scanning.
 If decorated services are imported before that window, startup fails with:
 `No active app service registry capture`.
@@ -131,7 +131,7 @@ install_di(app, service_packages=["app.services"])
 
 Guidelines:
 
-- Keep all `@Service` / `@ServiceDict` classes under one or more explicit packages (for example `app.services`).
+- Keep all `@Service` / `@ServiceMap` classes under one or more explicit packages (for example `app.services`).
 - Keep route handlers under `app.api.*`, and resolve dependencies via `Inject(...)` only.
 - Keep framework config (settings, logging, middleware wiring) under `app.core.*`.
 
@@ -211,13 +211,13 @@ class UserCacheService(BaseService):
         return UserCache()
 ```
 
-### 5. ServiceDict expansion
+### 5. ServiceMap expansion
 
 ```python
-from fastapiex.di import BaseService, ServiceDict
+from fastapiex.di import BaseService, ServiceMap
 
 
-@ServiceDict("{}_db_service", dict={"main": {"dsn": "sqlite+aiosqlite:///main.db"}})
+@ServiceMap("{}_db_service", mapping={"main": {"dsn": "sqlite+aiosqlite:///main.db"}})
 class DatabaseService(BaseService):
     @classmethod
     async def create(cls, dsn: str) -> "DatabaseService":
@@ -228,11 +228,11 @@ class DatabaseService(BaseService):
 
 ## Declaring Service-to-Service Dependencies
 
-Use `require(...)` in `create(...)` defaults.
+Use `Require(...)` in `create(...)` defaults.
 The example below reuses `UserRepo` and `UserCache` defined above.
 
 ```python
-from fastapiex.di import BaseService, Service, require
+from fastapiex.di import BaseService, Service, Require
 
 
 @Service("user_query_service_t", lifetime="transient")
@@ -240,8 +240,8 @@ class UserQueryServiceT(BaseService):
     @classmethod
     async def create(
         cls,
-        repo=require(UserRepo),
-        cache=require(UserCache),
+        repo=Require(UserRepo),
+        cache=Require(UserCache),
     ) -> "UserQueryServiceT":
         _ = repo, cache
         return cls()
@@ -341,7 +341,7 @@ Run checks:
 - `Cannot register services after container registrations are frozen`: runtime registration attempted after startup.
 - `No active app service registry capture`: decorated service module was imported before `install_di(...)` startup import scanning.
   Fix:
-  1. Move `@Service`/`@ServiceDict` classes into a dedicated module (for example `demo/services.py`).
+  1. Move `@Service`/`@ServiceMap` classes into a dedicated module (for example `demo/services.py`).
   2. Set `install_di(..., service_packages=["demo.services"])` to that module path.
   3. Remove early imports of that service module from `main.py`.
 
@@ -353,11 +353,11 @@ from fastapiex.di import (
     BaseService,
     Inject,
     Service,
-    ServiceDict,
+    ServiceMap,
     ServiceContainer,
     ServiceLifetime,
     capture_service_registrations,
     install_di,
-    require,
+    Require,
 )
 ```

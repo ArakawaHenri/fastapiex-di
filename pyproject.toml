@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fastapiex-di"
 version = "1.0.1"
-description = "DI extension for FastAPIEX"
+description = "DI extension for FastAPIEx"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }

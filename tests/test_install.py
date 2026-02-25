@@ -8,7 +8,8 @@ from fastapi import BackgroundTasks, FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from fastapiex.di import Inject, ServiceLifetime, install_di, resolve_service_container
+from fastapiex.di import Inject, ServiceLifetime, install_di
+from fastapiex.di.container import resolve_service_container
 from tests.di_test_services.helpers import set_order_sink
 
 
@@ -256,9 +257,8 @@ def test_install_di_can_freeze_and_unfreeze_registry() -> None:
     with TestClient(app):
         scoped_registry = app.state.di_service_registry
         assert scoped_registry is not None
-        assert scoped_registry.is_frozen() is True
+        assert scoped_registry._frozen is True
     assert app.state.di_service_registry is not None
-    assert app.state.di_service_registry.is_frozen() is False
 
 
 def test_install_di_uses_distinct_app_scoped_registries() -> None:

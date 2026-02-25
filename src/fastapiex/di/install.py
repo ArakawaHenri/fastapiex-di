@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class DISettings:
+class DIConfig:
     service_packages: tuple[str, ...]
     strict: bool = True
     allow_private_modules: bool = False
@@ -66,7 +66,7 @@ def install_di(
     freeze_service_registry_after_startup: bool = False,
     unfreeze_service_registry_on_shutdown: bool = True,
     eager_init_timeout_sec: float | None = None,
-) -> DISettings:
+) -> DIConfig:
     """
     Install DI/service-registry lifecycle into a FastAPI app.
 
@@ -75,10 +75,11 @@ def install_di(
     """
     if eager_init_timeout_sec is not None and eager_init_timeout_sec <= 0:
         raise ValueError("eager_init_timeout_sec must be > 0 when provided.")
-    if isinstance(getattr(app.state, "di_settings", None), DISettings):
-        raise RuntimeError("install_di() has already been called for this FastAPI app.")
+    if isinstance(getattr(app.state, "di_config", None), DIConfig):
+        raise RuntimeError(
+            "install_di() has already been called for this FastAPI app.")
 
-    settings = DISettings(
+    config = DIConfig(
         service_packages=_normalize_service_packages(service_packages),
         strict=strict,
         allow_private_modules=allow_private_modules,
@@ -89,7 +90,7 @@ def install_di(
         eager_init_timeout_sec=eager_init_timeout_sec,
     )
 
-    if settings.auto_add_finalizer_middleware and not _has_middleware(
+    if config.auto_add_finalizer_middleware and not _has_middleware(
         app,
         TransientServiceFinalizerMiddleware,
     ):
@@ -107,41 +108,43 @@ def install_di(
         try:
             try:
                 services = ServiceContainer()
-                sc_registry = get_or_create_service_container_registry(inner_app.state)
+                sc_registry = get_or_create_service_container_registry(
+                    inner_app.state)
                 sc_registry.register_current(services)
 
                 app_service_registry = AppServiceRegistry()
                 inner_app.state.di_service_registry = app_service_registry
                 with capture_service_registrations(
                     app_service_registry,
-                    include_packages=settings.service_packages,
+                    include_packages=config.service_packages,
                 ):
                     imported_modules = import_service_modules(
-                        settings.service_packages,
-                        allow_private_modules=settings.allow_private_modules,
+                        config.service_packages,
+                        allow_private_modules=config.allow_private_modules,
                     )
                 register_module_service_definitions(
                     app_service_registry,
                     imported_modules,
-                    include_packages=settings.service_packages,
+                    include_packages=config.service_packages,
                 )
+
                 await register_services_from_registry(
                     services,
                     registry=app_service_registry,
-                    eager_init_timeout_sec=settings.eager_init_timeout_sec,
+                    eager_init_timeout_sec=config.eager_init_timeout_sec,
                 )
 
-                if settings.freeze_container_after_startup:
+                if config.freeze_container_after_startup:
                     services.freeze_registrations()
 
                 if (
-                    settings.freeze_service_registry_after_startup
+                    config.freeze_service_registry_after_startup
                     and app_service_registry is not None
                 ):
                     app_service_registry.freeze()
 
             except Exception:
-                if settings.strict:
+                if config.strict:
                     raise
 
                 logger.exception(
@@ -169,13 +172,13 @@ def install_di(
                         sc_registry.unregister_current(expected=services)
 
             if (
-                settings.freeze_service_registry_after_startup
-                and settings.unfreeze_service_registry_on_shutdown
+                config.freeze_service_registry_after_startup
+                and config.unfreeze_service_registry_on_shutdown
                 and app_service_registry is not None
             ):
                 app_service_registry.unfreeze()
 
     app.router.lifespan_context = _combined_lifespan
-    app.state.di_settings = settings
+    app.state.di_config = config
     app.state.di_service_registry = None
-    return settings
+    return config
