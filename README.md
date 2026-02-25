@@ -72,17 +72,19 @@ Notes:
 ## Why Not Single-File
 
 `@Service` and `@ServiceMap` run at import time.
-The registration capture window is opened during `install_di(...)` startup import scanning.
-If decorated services are imported before that window, startup fails with:
-`No active app service registry capture`.
+`install_di(...)` discovers definitions by importing and scanning modules under `service_packages`.
+
+Early imports are allowed, but service modules should still live in a dedicated package
+and be included in `service_packages`. This keeps startup wiring predictable and avoids
+bootstrap-time circular imports.
 
 ## Import Timing Rules
 
 | Do | Don't |
 | --- | --- |
-| `install_di(app, service_packages=["demo.services"])` | `from demo.services import PingService` in `demo/main.py` |
-| Keep decorated services under a dedicated module/package | Put `@Service` classes in `main.py` |
-| Let DI scan import service modules during startup | Manually import decorated service modules in app bootstrap |
+| `install_di(app, service_packages=["demo.services"])` | Register services from modules that are not in `service_packages` |
+| Keep decorated services under a dedicated module/package | Scatter `@Service` classes across app bootstrap and route modules |
+| Let DI own service-module discovery during startup | Build side-effect-heavy bootstrap imports that increase cycle risk |
 
 ## Project Layout Contract
 
@@ -339,25 +341,32 @@ Run checks:
 - `Multiple services registered for type`: use key-based injection instead.
 - `Detected circular service dependency`: dependency graph has a cycle.
 - `Cannot register services after container registrations are frozen`: runtime registration attempted after startup.
-- `No active app service registry capture`: decorated service module was imported before `install_di(...)` startup import scanning.
+- `Service container not initialized for the current event loop`: DI startup did not complete for this app loop.
   Fix:
-  1. Move `@Service`/`@ServiceMap` classes into a dedicated module (for example `demo/services.py`).
-  2. Set `install_di(..., service_packages=["demo.services"])` to that module path.
-  3. Remove early imports of that service module from `main.py`.
+  1. Ensure `install_di(...)` is called exactly once during app creation.
+  2. Confirm `service_packages` uses import paths that can be imported at startup.
+  3. Keep `strict=True` in production so startup fails fast on DI wiring errors.
 
 ## Public API
 
 ```python
 from fastapiex.di import (
-    AppServiceRegistry,
     BaseService,
     Inject,
+    Require,
     Service,
     ServiceMap,
-    ServiceContainer,
     ServiceLifetime,
-    capture_service_registrations,
     install_di,
-    Require,
+)
+```
+
+Advanced APIs are available from submodules:
+
+```python
+from fastapiex.di.container import ServiceContainer
+from fastapiex.di.registry import (
+    AppServiceRegistry,
+    capture_service_registrations,
 )
 ```
