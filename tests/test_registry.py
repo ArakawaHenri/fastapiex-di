@@ -129,7 +129,7 @@ def test_service_map_rejects_positional_only_param_in_mapping_dict() -> None:
         build_service_plan(registry=registry)
 
 
-def test_app_scoped_registry_freeze_isolated() -> None:
+def test_app_scoped_registry_isolated() -> None:
     registry = AppServiceRegistry()
     with _capture_here(registry):
         @Service("scoped_service")
@@ -138,13 +138,9 @@ def test_app_scoped_registry_freeze_isolated() -> None:
             async def create(cls) -> ScopedService:
                 return cls()
 
-    assert registry._frozen is False
-    registry.freeze()
-    assert registry._frozen is True
-
-    # Another app registry stays unaffected.
     another = AppServiceRegistry()
-    assert another._frozen is False
+    assert len(registry.definitions()) == 1
+    assert another.definitions() == []
 
 
 def test_capture_service_registrations_collects_into_app_registry() -> None:

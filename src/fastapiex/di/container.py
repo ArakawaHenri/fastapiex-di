@@ -24,26 +24,34 @@ from fastapi.params import Depends
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .constants import (
+    APP_STATE_DI_CONFIG_ATTR,
+    APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR,
+    APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
+    APP_STATE_DI_SERVICE_REGISTRY_ATTR,
+    APP_STATE_SC_REGISTRY_ATTR,
+    REQUEST_FAILED_STATE_KEY,
+)
+from .errors import (
+    AmbiguousServiceByTypeError,
+    DuplicateServiceRegistrationError,
+    InvalidServiceDefinitionError,
+    ServiceContainerAccessError,
+    ServiceContainerStateError,
+    ServiceFactoryContractError,
+    ServiceRegistrationError,
+    UnregisteredServiceByKeyError,
+    UnregisteredServiceByTypeError,
+    UnregisteredServiceError,
+)
+from .types import CallableWithSignature, Ctor, Dtor
+
 logger = logging.getLogger(__name__)
 
-REQUEST_FAILED_STATE_KEY = "_svc_request_failed"
 _CURRENT_REQUEST_CTX: contextvars.ContextVar[HTTPConnection | None] = contextvars.ContextVar(
     "_svc_current_request",
     default=None,
 )
-
-# Factory (ctor) may return:
-# - a plain instance object
-# - an Awaitable[object] (async def or sync returning awaitable)
-# - a synchronous contextmanager-style factory via Iterator[object]
-# - an asynchronous contextmanager-style factory via AsyncIterator[object]
-Ctor = Callable[
-    ...,
-    object | Awaitable[object] | Iterator[object] | AsyncIterator[object],
-]
-
-# Destructor (dtor): takes an instance object and must be async
-Dtor = Callable[[object], Awaitable[None]] | None
 
 
 class ServiceLifetime(IntEnum):
@@ -138,13 +146,13 @@ class ServiceContainer:
             if container is None:
                 msg = "Requesting service from a destroyed container."
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise ServiceContainerStateError(msg)
             # Enforce single-loop usage.
             container._ensure_event_loop()
             if container.destructing:
                 msg = "Requesting service from a destructing container."
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise ServiceContainerStateError(msg)
 
         async def async_create_instance(self) -> None:
             """
@@ -180,7 +188,7 @@ class ServiceContainer:
                         "SINGLETON services. Use TRANSIENT lifetime instead."
                     )
                     logger.error(msg)
-                    raise RuntimeError(msg)
+                    raise ServiceRegistrationError(msg)
 
                 self.instance = result
 
@@ -233,7 +241,6 @@ class ServiceContainer:
         self._pid: int = os.getpid()
 
         self.destructing: bool = False
-        self._registrations_frozen: bool = False
         self._lock = asyncio.Lock()
 
     # --------------------------------------------------------------------- #
@@ -256,7 +263,7 @@ class ServiceContainer:
                 f"Each process must have its own ServiceContainer instance."
             )
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise ServiceContainerAccessError(msg)
 
     def _ensure_event_loop(self) -> asyncio.AbstractEventLoop:
         """
@@ -273,7 +280,7 @@ class ServiceContainer:
         except RuntimeError as exc:  # pragma: no cover - defensive
             msg = "ServiceContainer methods must be used within an asyncio event loop."
             logger.error(msg)
-            raise RuntimeError(msg) from exc
+            raise ServiceContainerAccessError(msg) from exc
 
         if self._loop is None:
             self._loop = loop
@@ -283,7 +290,7 @@ class ServiceContainer:
                 "this is not supported. Create a separate container per loop."
             )
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise ServiceContainerAccessError(msg)
 
         return loop
 
@@ -476,7 +483,7 @@ class ServiceContainer:
                 "Please provide a type annotation on the factory function or use a named registration."
             )
             logger.error(msg)
-            raise TypeError(msg)
+            raise InvalidServiceDefinitionError(msg)
 
         if service_type is None:
             return
@@ -491,7 +498,7 @@ class ServiceContainer:
                     f"a service of this type already exists."
                 )
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise ServiceRegistrationError(msg)
         else:
             # Named registration: cannot coexist with an anonymous one of same type.
             for sid in existing_ids:
@@ -502,7 +509,7 @@ class ServiceContainer:
                         f"a unique anonymous service of this type already exists."
                     )
                     logger.error(msg)
-                    raise RuntimeError(msg)
+                    raise ServiceRegistrationError(msg)
 
         if service_type not in self._type_index:
             self._type_index[service_type] = set()
@@ -512,20 +519,20 @@ class ServiceContainer:
         """
         Resolve a service by its public key.
 
-        Raises RuntimeError if no service is registered with the given key.
+        Raises UnregisteredServiceByKeyError if no service is registered with the given key.
         """
         internal_id = self._key_index.get(key)
         if internal_id is None:
             msg = f"Requesting unregistered service: {key}"
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise UnregisteredServiceByKeyError(msg)
         return self._services[internal_id]
 
     def _get_service_by_type(self, service_type: object) -> Service:
         """
         Resolve a service by its registered type.
 
-        Raises RuntimeError if:
+        Raises ServiceResolutionError if:
             - no service is registered for the given type; or
             - multiple services share the same type.
         """
@@ -533,14 +540,14 @@ class ServiceContainer:
         if not ids:
             msg = f"No service registered for type: {service_type!r}"
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise UnregisteredServiceByTypeError(msg)
         if len(ids) > 1:
             msg = (
                 f"Multiple services registered for type {service_type!r}; "
                 f"use key-based injection instead."
             )
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise AmbiguousServiceByTypeError(msg)
         internal_id = next(iter(ids))
         return self._services[internal_id]
 
@@ -568,14 +575,14 @@ class ServiceContainer:
                 f"expected a callable or None, got {type(dtor)!r}."
             )
             logger.error(msg)
-            raise TypeError(msg)
+            raise InvalidServiceDefinitionError(msg)
         if not inspect.iscoroutinefunction(dtor):
             msg = (
                 f"Invalid destructor for service key={key!r}: "
                 "destructor must be defined as async def."
             )
             logger.error(msg)
-            raise TypeError(msg)
+            raise InvalidServiceDefinitionError(msg)
         try:
             signature = inspect.signature(dtor)
         except (TypeError, ValueError):
@@ -588,7 +595,7 @@ class ServiceContainer:
                 "destructor must accept the service instance as a positional argument."
             )
             logger.error(msg)
-            raise TypeError(msg) from exc
+            raise InvalidServiceDefinitionError(msg) from exc
 
     async def _aget_impl(
             self,
@@ -623,7 +630,7 @@ class ServiceContainer:
                 if self.destructing:
                     msg = f"Requesting service '{key_label}' while container is destructing."
                     logger.error(msg)
-                    raise RuntimeError(msg)
+                    raise ServiceContainerStateError(msg)
                 if service.instance is not None:
                     return service.instance
 
@@ -651,7 +658,7 @@ class ServiceContainer:
                 try:
                     instance = await agen.__anext__()
                 except StopAsyncIteration:
-                    raise RuntimeError(
+                    raise ServiceFactoryContractError(
                         f"Async contextmanager service '{key_label}' did not yield a value."
                     ) from None
 
@@ -673,14 +680,14 @@ class ServiceContainer:
                                 return
                             except _RequestFailedSignal:
                                 return
-                            raise RuntimeError(
+                            raise ServiceFactoryContractError(
                                 f"Async contextmanager service '{key_label}' must yield exactly once."
                             )
                         try:
                             await agen.__anext__()
                         except StopAsyncIteration:
                             return
-                        raise RuntimeError(
+                        raise ServiceFactoryContractError(
                             f"Async contextmanager service '{key_label}' must yield exactly once."
                         )
                     finally:
@@ -711,7 +718,7 @@ class ServiceContainer:
                 except StopIteration:
                     msg = f"Contextmanager service '{key_label}' did not yield a value."
                     logger.error(msg)
-                    raise RuntimeError(msg)  # noqa: B904
+                    raise ServiceFactoryContractError(msg)  # noqa: B904
 
                 async def _close_gen() -> None:
                     """
@@ -733,14 +740,14 @@ class ServiceContainer:
                                     return
                                 except _RequestFailedSignal:
                                     return
-                                raise RuntimeError(
+                                raise ServiceFactoryContractError(
                                     f"Contextmanager service '{key_label}' must yield exactly once."
                                 )
                             try:
                                 next(gen)
                             except StopIteration:
                                 return
-                            raise RuntimeError(
+                            raise ServiceFactoryContractError(
                                 f"Contextmanager service '{key_label}' must yield exactly once."
                             )
                         except _RequestFailedSignal:
@@ -783,16 +790,6 @@ class ServiceContainer:
     # --------------------------------------------------------------------- #
     # Public API                                                            #
     # --------------------------------------------------------------------- #
-
-    def freeze_registrations(self) -> None:
-        """
-        Freeze runtime registration updates on this container.
-
-        Intended for production startup flow: register everything once,
-        then reject accidental runtime mutation.
-        """
-        self._ensure_event_loop()
-        self._registrations_frozen = True
 
     async def register(
             self,
@@ -839,26 +836,21 @@ class ServiceContainer:
                 f"expected ServiceLifetime, got {lifetime!r} ({type(lifetime)!r})."
             )
             logger.error(msg)
-            raise TypeError(msg)
+            raise InvalidServiceDefinitionError(msg)
 
         async with self._lock:
             public_key = key
             internal_id = uuid.uuid4().hex
 
-            if self._registrations_frozen:
-                msg = "Cannot register services after container registrations are frozen."
-                logger.error(msg)
-                raise RuntimeError(msg)
-
             if self.destructing:
                 msg = "Cannot register services while container is destructing."
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise ServiceContainerStateError(msg)
 
             if public_key is not None and public_key in self._key_index:
                 msg = f"Duplicate service registration for key: {public_key}"
                 logger.error(msg)
-                raise RuntimeError(msg)
+                raise DuplicateServiceRegistrationError(msg)
 
             dtor_candidate: object | None = dtor
             self._validate_destructor(dtor_candidate, public_key)
@@ -1081,7 +1073,7 @@ class ServiceContainerRegistry:
         with self._lock:
             existing = self._containers.get(key)
             if existing is not None and existing is not container:
-                raise RuntimeError(
+                raise ServiceContainerStateError(
                     "A different ServiceContainer is already registered for the current event loop."
                 )
             self._containers[key] = container
@@ -1123,27 +1115,23 @@ class _AppStateWithRegistry(Protocol):
     sc_registry: ServiceContainerRegistry
 
 
-class _CallableWithSignature(Protocol):
-    __signature__: inspect.Signature
-
-
 def get_or_create_service_container_registry(
     app_state: object,
 ) -> ServiceContainerRegistry:
     """
     Return the app-level ServiceContainerRegistry, creating it if necessary.
     """
-    registry = getattr(app_state, "sc_registry", None)
+    registry = getattr(app_state, APP_STATE_SC_REGISTRY_ATTR, None)
     if isinstance(registry, ServiceContainerRegistry):
         return registry
 
     with _APP_STATE_REGISTRY_LOCK:
-        registry = getattr(app_state, "sc_registry", None)
+        registry = getattr(app_state, APP_STATE_SC_REGISTRY_ATTR, None)
         if isinstance(registry, ServiceContainerRegistry):
             return registry
         registry = ServiceContainerRegistry()
         state = cast(_AppStateWithRegistry, app_state)
-        state.sc_registry = registry
+        setattr(state, APP_STATE_SC_REGISTRY_ATTR, registry)
         return registry
 
 
@@ -1157,7 +1145,7 @@ def resolve_service_container(app_state: object) -> ServiceContainer | None:
     if app_state is None:
         return None
 
-    registry = getattr(app_state, "sc_registry", None)
+    registry = getattr(app_state, APP_STATE_SC_REGISTRY_ATTR, None)
     if isinstance(registry, ServiceContainerRegistry):
         return registry.get_current()
     return None
@@ -1187,7 +1175,6 @@ def Inject(
 
        This requires that exactly one service of type MyType is registered.
     """
-    # Decide lookup mode.
     lookup_value: str | type[object]
     if isinstance(target, str):
         key_specified = True
@@ -1196,11 +1183,10 @@ def Inject(
         key_specified = False
         lookup_value = target
     else:
-        raise TypeError(
+        raise InvalidServiceDefinitionError(
             "Inject() expects either a service key (str) or a service type."
         )
 
-    # Build the dependency signature.
     params = [
         inspect.Parameter(
             "request",
@@ -1213,35 +1199,84 @@ def Inject(
     kw_dep_map: dict[str, str] = {}
     kw_static: dict[str, object] = {}
 
-    for i, a in enumerate(args):
-        if isinstance(a, Depends):
+    for i, value in enumerate(args):
+        if isinstance(value, Depends):
             name = f"_dep_arg_{i}_{uuid.uuid4().hex[:8]}"
             params.append(
                 inspect.Parameter(
                     name,
                     inspect.Parameter.KEYWORD_ONLY,
-                    default=a,
+                    default=value,
                 )
             )
             pos_dep_map[i] = name
-        else:
-            pos_static[i] = a
+            continue
+        pos_static[i] = value
 
-    for k, v in kwargs.items():
-        if isinstance(v, Depends):
-            name = f"_dep_kw_{k}_{uuid.uuid4().hex[:8]}"
+    for key, value in kwargs.items():
+        if isinstance(value, Depends):
+            name = f"_dep_kw_{key}_{uuid.uuid4().hex[:8]}"
             params.append(
                 inspect.Parameter(
                     name,
                     inspect.Parameter.KEYWORD_ONLY,
-                    default=v,
+                    default=value,
                 )
             )
-            kw_dep_map[k] = name
-        else:
-            kw_static[k] = v
+            kw_dep_map[key] = name
+            continue
+        kw_static[key] = value
 
-    sig = inspect.Signature(params)
+    signature = inspect.Signature(params)
+
+    async def _resolve_once(
+        services: ServiceContainer,
+        *runtime_args: object,
+        **runtime_kwargs: object,
+    ) -> object:
+        if isinstance(lookup_value, str):
+            return await services.aget_by_key(lookup_value, *runtime_args, **runtime_kwargs)
+        return await services.aget_by_type(lookup_value, *runtime_args, **runtime_kwargs)
+
+    async def _refresh_container_registrations(
+        request: HTTPConnection,
+        services: ServiceContainer,
+    ) -> bool:
+        app_state = getattr(request.app, "state", None)
+        di_config = getattr(app_state, APP_STATE_DI_CONFIG_ATTR, None)
+        app_service_registry = getattr(app_state, APP_STATE_DI_SERVICE_REGISTRY_ATTR, None)
+        registered_origins = getattr(
+            app_state,
+            APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
+            None,
+        )
+        refresh_lock = getattr(app_state, APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR, None)
+        if app_service_registry is None or not isinstance(registered_origins, set):
+            return False
+
+        from .registry import refresh_services_for_container
+
+        async def _run_refresh() -> None:
+            await refresh_services_for_container(
+                services,
+                registry=app_service_registry,
+                registered_origins=registered_origins,
+                include_global_registry=bool(
+                    getattr(di_config, "use_global_service_registry", False)
+                ),
+                eager_init_timeout_sec=getattr(
+                    di_config,
+                    "eager_init_timeout_sec",
+                    None,
+                ),
+            )
+
+        if isinstance(refresh_lock, asyncio.Lock):
+            async with refresh_lock:
+                await _run_refresh()
+        else:
+            await _run_refresh()
+        return True
 
     async def _dependency_callable(
         request: HTTPConnection,
@@ -1253,27 +1288,29 @@ def Inject(
                 "Service container not initialized for the current event loop on FastAPI app state (sc_registry)."
             )
             logger.error(msg)
-            raise RuntimeError(msg)
+            raise ServiceContainerStateError(msg)
 
-        # Reconstruct positional arguments.
         final_args = [
-            resolved_deps[pos_dep_map[i]
-                          ] if i in pos_dep_map else pos_static[i]
-            for i in range(len(args))
+            resolved_deps[pos_dep_map[index]]
+            if index in pos_dep_map
+            else pos_static[index]
+            for index in range(len(args))
         ]
-        # Reconstruct keyword arguments.
         final_kwargs = {
-            k: resolved_deps[kw_dep_map[k]
-                             ] if k in kw_dep_map else kw_static[k]
-            for k in kwargs
+            key: resolved_deps[kw_dep_map[key]]
+            if key in kw_dep_map
+            else kw_static[key]
+            for key in kwargs
         }
-
-        # Attach request for tracking transient finalizers.
         final_kwargs[services.request_kwarg_name()] = request
 
-        if isinstance(lookup_value, str):
-            return await services.aget_by_key(lookup_value, *final_args, **final_kwargs)
-        return await services.aget_by_type(lookup_value, *final_args, **final_kwargs)
+        try:
+            return await _resolve_once(services, *final_args, **final_kwargs)
+        except UnregisteredServiceError:
+            refreshed = await _refresh_container_registrations(request, services)
+            if not refreshed:
+                raise
+            return await _resolve_once(services, *final_args, **final_kwargs)
 
     # Improve callable name for better error stacks & docs
     name_suffix = (
@@ -1287,9 +1324,9 @@ def Inject(
     )
     _dependency_callable.__qualname__ = _dependency_callable.__name__
     dependency_callable_with_signature = cast(
-        _CallableWithSignature, _dependency_callable
+        CallableWithSignature, _dependency_callable
     )
-    dependency_callable_with_signature.__signature__ = sig
+    dependency_callable_with_signature.__signature__ = signature
 
     return Depends(_dependency_callable)
 

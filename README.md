@@ -82,7 +82,7 @@ bootstrap-time circular imports.
 
 | Do | Don't |
 | --- | --- |
-| `install_di(app, service_packages=["demo.services"])` | Register services from modules that are not in `service_packages` |
+| `install_di(app, service_packages=["demo.services"])` | Rely on services outside `service_packages` unless `use_global_service_registry=True` is intentional |
 | Keep decorated services under a dedicated module/package | Scatter `@Service` classes across app bootstrap and route modules |
 | Let DI own service-module discovery during startup | Build side-effect-heavy bootstrap imports that increase cycle risk |
 
@@ -290,11 +290,11 @@ async def nested(
 
 - `service_packages`: package(s) to scan for decorated services.
 - `strict` (default `True`): fail startup on DI/registry errors.
-- `allow_private_modules` (default `False`): include modules with underscore segments.
+- `use_global_service_registry` (default `False`): maintain a global registry for services declared outside all configured `service_packages`.
+  On unresolved injection, DI always performs one app-local refresh attempt; with this flag enabled, that refresh also merges global definitions.
+- `allow_private_modules` (default `False`): include underscore modules during package scan/import.
+  Private modules imported manually at runtime can still register if they belong to configured `service_packages`.
 - `auto_add_finalizer_middleware` (default `True`): auto install transient cleanup middleware.
-- `freeze_container_after_startup` (default `True`): block runtime service registrations.
-- `freeze_service_registry_after_startup` (default `False`): freeze this app's scoped service registry after startup.
-- `unfreeze_service_registry_on_shutdown` (default `True`): unfreeze this app's registry when app exits.
 - `eager_init_timeout_sec` (optional): timeout for eager singleton initialization.
 
 Recommended production defaults:
@@ -304,8 +304,6 @@ install_di(
     app,
     service_packages=["myapp.services"],
     strict=True,
-    freeze_container_after_startup=True,
-    freeze_service_registry_after_startup=True,
     eager_init_timeout_sec=30,
 )
 ```
@@ -315,7 +313,6 @@ install_di(
 - Container enforces single event-loop usage.
 - Container rejects cross-process reuse.
 - Registry maps container by current process/thread/event-loop context.
-- Runtime service registry is app-scoped, so freeze/unfreeze does not leak across apps.
 - Transient finalizers run after request completion.
 - Transient finalizers also run after WebSocket connection teardown.
 - Singleton teardown runs on shutdown in reverse order.
@@ -336,11 +333,12 @@ Run checks:
 
 ## Common Errors
 
+- DI-defined API/runtime exceptions are custom (`fastapiex.di.errors.*`) and inherit `DIError`.
+  Import-time failures from Python (for example `ModuleNotFoundError` from invalid `service_packages`) can still bubble up.
 - `Duplicate service registration for key`: same key registered more than once.
 - `No service registered for type`: missing provider for type-based injection.
 - `Multiple services registered for type`: use key-based injection instead.
 - `Detected circular service dependency`: dependency graph has a cycle.
-- `Cannot register services after container registrations are frozen`: runtime registration attempted after startup.
 - `Service container not initialized for the current event loop`: DI startup did not complete for this app loop.
   Fix:
   1. Ensure `install_di(...)` is called exactly once during app creation.

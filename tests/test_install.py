@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import anyio
@@ -13,12 +14,11 @@ from fastapiex.di.container import resolve_service_container
 from tests.di_test_services.helpers import set_order_sink
 
 
-def test_install_di_wires_injection_and_freezes_runtime_registration() -> None:
+def test_install_di_wires_injection_and_allows_runtime_registration() -> None:
     app = FastAPI()
     install_di(
         app,
         service_packages=["tests.di_test_services"],
-        freeze_container_after_startup=True,
     )
 
     @app.get("/ping")
@@ -52,8 +52,57 @@ def test_install_di_wires_injection_and_freezes_runtime_registration() -> None:
 
         register_response = client.post("/register")
         assert register_response.status_code == 200
-        error = register_response.json().get("error", "")
-        assert "frozen" in error.lower()
+        assert register_response.json() == {"ok": True}
+
+
+def test_install_di_inject_does_not_retry_on_non_registration_runtime_error() -> None:
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+    call_count = 0
+
+    @app.post("/register-boom")
+    async def register_runtime_boom_service() -> dict[str, bool]:
+        nonlocal call_count
+        services = resolve_service_container(app.state)
+        assert services is not None
+
+        async def boom_factory() -> dict[str, bool]:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("boom from ctor")
+
+        await services.register(
+            "boom_service",
+            ServiceLifetime.TRANSIENT,
+            boom_factory,
+            None,
+        )
+        return {"ok": True}
+
+    @app.get("/boom")
+    async def boom(_svc=Inject("boom_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        register_response = client.post("/register-boom")
+        assert register_response.status_code == 200
+        assert register_response.json() == {"ok": True}
+
+        with pytest.raises(RuntimeError, match="boom from ctor"):
+            client.get("/boom")
+
+    assert call_count == 1
+
+
+def test_install_di_stores_service_packages_as_global_paths() -> None:
+    app = FastAPI()
+    config = install_di(app, service_packages=["tests.di_test_services"])
+
+    assert config.service_packages
+    for path in config.service_packages:
+        resolved = Path(path)
+        assert resolved.is_absolute()
+        assert resolved.exists()
 
 
 def test_install_di_finalizer_runs_after_background_tasks() -> None:
@@ -244,20 +293,14 @@ def test_install_di_strict_true_fails_on_missing_service_package() -> None:
             pass
 
 
-def test_install_di_can_freeze_and_unfreeze_registry() -> None:
+def test_install_di_exposes_registry_on_startup() -> None:
     app = FastAPI()
-    install_di(
-        app,
-        service_packages=["tests.di_test_services"],
-        freeze_service_registry_after_startup=True,
-        unfreeze_service_registry_on_shutdown=True,
-    )
+    install_di(app, service_packages=["tests.di_test_services"])
 
     assert app.state.di_service_registry is None
     with TestClient(app):
         scoped_registry = app.state.di_service_registry
         assert scoped_registry is not None
-        assert scoped_registry._frozen is True
     assert app.state.di_service_registry is not None
 
 
@@ -298,6 +341,110 @@ def test_install_di_reregisters_services_when_modules_are_cached() -> None:
     with TestClient(app_second) as client:
         second = client.get("/resolve")
         assert second.status_code == 200
+
+
+def test_install_di_global_registry_true_includes_services_outside_service_packages() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=True,
+    )
+
+    @app.get("/global")
+    async def resolve_global(_svc=Inject("external_global_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        import tests.di_global_services.main  # noqa: F401
+
+        response = client.get("/global")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+
+def test_install_di_global_registry_false_ignores_services_outside_service_packages() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=False,
+    )
+
+    @app.get("/global")
+    async def resolve_global(_svc=Inject("external_global_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        import tests.di_global_services.main  # noqa: F401
+
+        with pytest.raises(
+            RuntimeError,
+            match="Requesting unregistered service: external_global_service",
+        ):
+            client.get("/global")
+
+
+def test_install_di_refresh_registers_late_private_service_without_global_registry() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=False,
+    )
+
+    @app.get("/late-private")
+    async def resolve_late_private(_svc=Inject("late_private_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        import tests.di_test_services._late_private  # noqa: F401
+
+        response = client.get("/late-private")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+
+def test_install_di_global_registry_true_refreshes_after_startup_late_import() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=True,
+    )
+
+    @app.get("/late-global")
+    async def resolve_late_global(_svc=Inject("external_late_global_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        import tests.di_global_services.late  # noqa: F401
+
+        response = client.get("/late-global")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+
+def test_install_di_global_registry_false_does_not_refresh_after_startup_late_import() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=False,
+    )
+
+    @app.get("/late-global")
+    async def resolve_late_global(_svc=Inject("external_late_global_service")):
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        import tests.di_global_services.late  # noqa: F401
+
+        with pytest.raises(
+            RuntimeError,
+            match="Requesting unregistered service: external_late_global_service",
+        ):
+            client.get("/late-global")
 
 
 def test_install_di_rejects_double_install() -> None:

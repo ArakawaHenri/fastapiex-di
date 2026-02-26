@@ -18,6 +18,10 @@ from fastapiex.di.container import (
     get_or_create_service_container_registry,
     resolve_service_container,
 )
+from fastapiex.di.errors import (
+    UnregisteredServiceByKeyError,
+    UnregisteredServiceByTypeError,
+)
 
 
 @pytest.mark.asyncio
@@ -291,6 +295,20 @@ async def test_key_based_injection():
 
     instance = cast(dict[str, str], await container.aget_by_key("my_service"))
     assert instance["message"] == "Hello from service"
+
+
+@pytest.mark.asyncio
+async def test_unregistered_resolution_raises_domain_specific_errors() -> None:
+    container = ServiceContainer()
+
+    class MissingType:
+        pass
+
+    with pytest.raises(UnregisteredServiceByKeyError):
+        await container.aget_by_key("missing_key")
+
+    with pytest.raises(UnregisteredServiceByTypeError):
+        await container.aget_by_type(MissingType)
 
 
 @pytest.mark.asyncio

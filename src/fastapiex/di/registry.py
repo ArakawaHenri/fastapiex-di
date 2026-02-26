@@ -3,31 +3,39 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import importlib
+import importlib.util
 import inspect
 import logging
+import os
 import pkgutil
 import sys
 import threading
 from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import (
     Literal,
-    Protocol,
     TypeVar,
     cast,
     overload,
 )
 
+from .constants import SERVICE_DEFAULT_DESTROY_MARKER, SERVICE_DEFINITION_ATTR
 from .container import ServiceContainer, ServiceLifetime
+from .errors import (
+    CircularServiceDependencyError,
+    DITypeError,
+    DIValueError,
+    InvalidServiceDefinitionError,
+    ServiceDependencyError,
+    ServiceMappingError,
+    ServiceRegistryError,
+)
+from .types import CallableWithSignature, Ctor, Dtor
 
 logger = logging.getLogger(__name__)
 
-Ctor = Callable[..., object]
-Dtor = Callable[[object], Awaitable[None]] | None
-_DEFAULT_DESTROY_MARKER = "__service_default_destroy_noop__"
-_SERVICE_DEFINITION_ATTR = "__fastapi_di_definition__"
 LifetimeLike = ServiceLifetime | int | Literal[
     "Singleton",
     "Transient",
@@ -61,10 +69,6 @@ ResolvedSpec = tuple[
     str | None,
 ]
 _S = TypeVar("_S", bound=object)
-
-
-class _CallableWithSignature(Protocol):
-    __signature__: inspect.Signature
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,7 @@ RequiredDependency = RequiredService
 @dataclass(frozen=True)
 class _ServiceDefinition:
     origin: str
+    module_path: str | None
     service_cls: type[object]
     key_template: str | None
     lifetime: ServiceLifetime
@@ -146,12 +151,19 @@ class RegisteredService:
     service_type: object
 
 
+@dataclass(frozen=True)
+class _RuntimeRegistryBinding:
+    registry: AppServiceRegistry
+    package_paths: tuple[str, ...]
+    use_global_service_registry: bool
+
+
 class AppServiceRegistry:
     """
     App-scoped registry for resolved service definitions.
 
     Each FastAPI app should use its own registry instance to avoid cross-app
-    state interference (for example freeze/unfreeze side effects).
+    state interference.
     """
 
     def __init__(
@@ -161,7 +173,6 @@ class AppServiceRegistry:
         self._lock = threading.Lock()
         self._definitions_by_origin: dict[str, _ServiceDefinition] = {}
         self._definition_order: list[str] = []
-        self._frozen = False
         if definitions:
             for definition in definitions:
                 self.register(definition)
@@ -171,10 +182,6 @@ class AppServiceRegistry:
             existing = self._definitions_by_origin.get(definition.origin)
             if existing is not None:
                 return
-            if self._frozen:
-                raise RuntimeError(
-                    "AppServiceRegistry is frozen and cannot accept new service definitions."
-                )
             self._definitions_by_origin[definition.origin] = definition
             self._definition_order.append(definition.origin)
 
@@ -186,13 +193,82 @@ class AppServiceRegistry:
                 if origin in self._definitions_by_origin
             ]
 
-    def freeze(self) -> None:
-        with self._lock:
-            self._frozen = True
 
-    def unfreeze(self) -> None:
-        with self._lock:
-            self._frozen = False
+_GLOBAL_SERVICE_REGISTRY = AppServiceRegistry()
+_RUNTIME_REGISTRY_BINDINGS: dict[int, _RuntimeRegistryBinding] = {}
+_RUNTIME_REGISTRY_BINDINGS_LOCK = threading.Lock()
+
+
+def get_global_service_definitions() -> list[_ServiceDefinition]:
+    """
+    Return globally collected service definitions.
+
+    Global definitions are collected at decorator execution time and can be
+    reused by multiple FastAPI app instances when install_di(..., use_global_service_registry=True).
+    """
+    return _GLOBAL_SERVICE_REGISTRY.definitions()
+
+
+def resolve_service_package_paths(
+    package_names: str | Sequence[str],
+) -> tuple[str, ...]:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for package_name in _normalize_package_names(package_names):
+        try:
+            spec = importlib.util.find_spec(package_name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            continue
+
+        candidate_paths: list[str] = []
+        if spec.submodule_search_locations:
+            candidate_paths.extend(spec.submodule_search_locations)
+        elif spec.origin and spec.origin not in {"built-in", "frozen"}:
+            candidate_paths.append(spec.origin)
+
+        for path in candidate_paths:
+            normalized = os.path.realpath(os.path.abspath(path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            resolved.append(normalized)
+    return tuple(resolved)
+
+
+def register_runtime_registry_binding(
+    registry: AppServiceRegistry,
+    *,
+    package_paths: Sequence[str],
+    use_global_service_registry: bool,
+) -> None:
+    normalized_paths = tuple(
+        os.path.realpath(os.path.abspath(path))
+        for path in package_paths
+    )
+    binding = _RuntimeRegistryBinding(
+        registry=registry,
+        package_paths=normalized_paths,
+        use_global_service_registry=use_global_service_registry,
+    )
+    with _RUNTIME_REGISTRY_BINDINGS_LOCK:
+        _RUNTIME_REGISTRY_BINDINGS[id(registry)] = binding
+
+
+def unregister_runtime_registry_binding(registry: AppServiceRegistry) -> None:
+    with _RUNTIME_REGISTRY_BINDINGS_LOCK:
+        _RUNTIME_REGISTRY_BINDINGS.pop(id(registry), None)
+
+
+def _runtime_registry_bindings_snapshot() -> tuple[tuple[_RuntimeRegistryBinding, ...], bool]:
+    with _RUNTIME_REGISTRY_BINDINGS_LOCK:
+        bindings = tuple(_RUNTIME_REGISTRY_BINDINGS.values())
+    maintain_global = any(
+        binding.use_global_service_registry
+        for binding in bindings
+    )
+    return bindings, maintain_global
 
 
 @dataclass(frozen=True)
@@ -216,6 +292,43 @@ def _register_definition_into_active_registry(definition: _ServiceDefinition) ->
     capture.registry.register(definition)
 
 
+def _definition_matches_package_paths(
+    definition: _ServiceDefinition,
+    package_paths: Sequence[str],
+) -> bool:
+    module_path = definition.module_path
+    if module_path is None:
+        return False
+    normalized_module = os.path.realpath(os.path.abspath(module_path))
+    for raw_base in package_paths:
+        normalized_base = os.path.realpath(os.path.abspath(raw_base))
+        if os.path.isfile(normalized_base):
+            if normalized_module == normalized_base:
+                return True
+            continue
+        try:
+            if os.path.commonpath([normalized_module, normalized_base]) == normalized_base:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _register_definition_into_runtime_registries(
+    definition: _ServiceDefinition,
+) -> None:
+    bindings, maintain_global = _runtime_registry_bindings_snapshot()
+    matched = False
+    for binding in bindings:
+        if not _definition_matches_package_paths(definition, binding.package_paths):
+            continue
+        binding.registry.register(definition)
+        matched = True
+
+    if not matched and maintain_global:
+        _GLOBAL_SERVICE_REGISTRY.register(definition)
+
+
 def Require(
     target: str | type[object],
     *args: object,
@@ -223,7 +336,7 @@ def Require(
     **kwargs: object,
 ) -> RequiredService:
     if not isinstance(target, (str, type)):
-        raise TypeError("Require() expects a service key (str) or a service type")
+        raise DITypeError("Require() expects a service key (str) or a service type")
     return RequiredService(
         target=target,
         args=tuple(args),
@@ -239,7 +352,7 @@ def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
         try:
             return ServiceLifetime(lifetime)
         except ValueError as exc:
-            raise ValueError(
+            raise DIValueError(
                 f"Unsupported lifetime value: {lifetime!r}. Use ServiceLifetime.SINGLETON/TRANSIENT or 0/1."
             ) from exc
     if isinstance(lifetime, str):
@@ -248,10 +361,10 @@ def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
             return ServiceLifetime.SINGLETON
         if normalized == "transient":
             return ServiceLifetime.TRANSIENT
-        raise ValueError(
+        raise DIValueError(
             f"Unsupported lifetime string: {lifetime!r}. Use 'Singleton' or 'Transient'."
         )
-    raise TypeError(
+    raise DITypeError(
         "Invalid lifetime type: "
         f"{type(lifetime)!r}. Use ServiceLifetime, int (0/1), or 'Singleton'/'Transient'."
     )
@@ -259,34 +372,34 @@ def _normalize_lifetime(lifetime: LifetimeLike) -> ServiceLifetime:
 
 def _extract_ctors(service_cls: type[object]) -> tuple[Ctor, Dtor]:
     if inspect.isabstract(service_cls):
-        raise TypeError(
+        raise InvalidServiceDefinitionError(
             f"{service_cls!r} is abstract; define a concrete @classmethod create()."
         )
 
     raw_create = inspect.getattr_static(service_cls, "create", None)
     if raw_create is None:
-        raise TypeError(f"{service_cls!r} is missing required classmethod create().")
+        raise InvalidServiceDefinitionError(f"{service_cls!r} is missing required classmethod create().")
     if not isinstance(raw_create, classmethod):
-        raise TypeError(f"{service_cls!r}.create must be defined as @classmethod.")
+        raise InvalidServiceDefinitionError(f"{service_cls!r}.create must be defined as @classmethod.")
 
     ctor = getattr(service_cls, "create", None)
     if ctor is None or not callable(ctor):
-        raise TypeError(f"{service_cls!r}.create must be callable.")
+        raise InvalidServiceDefinitionError(f"{service_cls!r}.create must be callable.")
 
     raw_destroy = inspect.getattr_static(service_cls, "destroy", None)
     if raw_destroy is None:
         return ctor, None
     if not isinstance(raw_destroy, classmethod):
-        raise TypeError(f"{service_cls!r}.destroy must be defined as @classmethod.")
-    if getattr(raw_destroy, _DEFAULT_DESTROY_MARKER, False):
+        raise InvalidServiceDefinitionError(f"{service_cls!r}.destroy must be defined as @classmethod.")
+    if getattr(raw_destroy, SERVICE_DEFAULT_DESTROY_MARKER, False):
         # Inherited default no-op hook from BaseService.
         return ctor, None
 
     dtor = getattr(service_cls, "destroy", None)
     if dtor is None or not callable(dtor):
-        raise TypeError(f"{service_cls!r}.destroy must be callable.")
+        raise InvalidServiceDefinitionError(f"{service_cls!r}.destroy must be callable.")
     if not inspect.iscoroutinefunction(dtor):
-        raise TypeError(
+        raise InvalidServiceDefinitionError(
             f"{service_cls!r}.destroy must be an async @classmethod."
         )
     return ctor, dtor
@@ -303,6 +416,15 @@ def _extract_dependencies(ctor: Ctor) -> dict[str, RequiredDependency]:
     return deps
 
 
+def _resolve_service_class_module_path(service_cls: type[object]) -> str | None:
+    module = sys.modules.get(service_cls.__module__)
+    if module is not None:
+        module_file = getattr(module, "__file__", None)
+        if isinstance(module_file, str):
+            return os.path.realpath(os.path.abspath(module_file))
+    return None
+
+
 def _register_service_class(
     service_cls: type[object],
     *,
@@ -317,15 +439,16 @@ def _register_service_class(
 
     resolved_lifetime = _normalize_lifetime(lifetime)
     if eager and resolved_lifetime != ServiceLifetime.SINGLETON:
-        raise ValueError(
+        raise DIValueError(
             f"Service '{service_cls.__name__}' cannot be eager with transient lifetime."
         )
     if source is not None and key is None:
-        raise ValueError(
+        raise DIValueError(
             f"ServiceMap '{service_cls.__name__}' requires a non-empty key template."
         )
     definition = _ServiceDefinition(
         origin=f"{service_cls.__module__}.{service_cls.__qualname__}",
+        module_path=_resolve_service_class_module_path(service_cls),
         service_cls=service_cls,
         key_template=key,
         lifetime=resolved_lifetime,
@@ -336,8 +459,9 @@ def _register_service_class(
         source=source,
         exposed_type=exposed_type,
     )
-    setattr(service_cls, _SERVICE_DEFINITION_ATTR, definition)
+    setattr(service_cls, SERVICE_DEFINITION_ATTR, definition)
     _register_definition_into_active_registry(definition)
+    _register_definition_into_runtime_registries(definition)
     return service_cls
 
 
@@ -396,7 +520,7 @@ def Service(
     if isinstance(key, type):
         return _register_with_key(key, None)
     if key is not None and not isinstance(key, str):
-        raise TypeError(
+        raise DITypeError(
             "Service() expects a key string, a service class, or no positional argument."
         )
 
@@ -434,7 +558,7 @@ def _normalize_package_names(
         return (package_names,)
     normalized = tuple(name for name in package_names if name)
     if not normalized:
-        raise ValueError("At least one service package must be provided.")
+        raise DIValueError("At least one service package must be provided.")
     return normalized
 
 
@@ -475,7 +599,7 @@ def _module_service_definitions(module_name: str) -> list[_ServiceDefinition]:
     for _name, cls in inspect.getmembers(module, inspect.isclass):
         if cls.__module__ != module_name:
             continue
-        definition = getattr(cls, _SERVICE_DEFINITION_ATTR, None)
+        definition = getattr(cls, SERVICE_DEFINITION_ATTR, None)
         if isinstance(definition, _ServiceDefinition):
             definitions.append(definition)
     return definitions
@@ -510,7 +634,7 @@ def _coerce_mapping_value(
     if hasattr(value, "model_dump") and callable(value.model_dump):
         raw = value.model_dump()
         if not isinstance(raw, Mapping):
-            raise TypeError("model_dump() must return a mapping")
+            raise ServiceMappingError("model_dump() must return a mapping")
         mapping_kwargs = dict(raw)
         _validate_mapping_kwargs(signature=signature, mapping_kwargs=mapping_kwargs)
         return (), mapping_kwargs
@@ -544,7 +668,7 @@ def _coerce_mapping_value(
             positional_target = parameter
             break
     if positional_target is None:
-        raise TypeError("Unable to map ServiceMap value to ctor parameters")
+        raise ServiceMappingError("Unable to map ServiceMap value to ctor parameters")
 
     positional_slots = [
         parameter
@@ -560,7 +684,7 @@ def _coerce_mapping_value(
         if parameter.name == positional_target.name
     )
     if target_index != 0:
-        raise TypeError(
+        raise ServiceMappingError(
             "Scalar ServiceMap value cannot bind positional-only parameter "
             f"'{positional_target.name}' because earlier positional parameters exist. "
             "Use mapping={...} for explicit binding."
@@ -580,7 +704,7 @@ def _validate_mapping_kwargs(
     }
     for name in mapping_kwargs:
         if name in positional_only:
-            raise TypeError(
+            raise ServiceMappingError(
                 "ServiceMap mapping cannot pass positional-only "
                 f"parameter '{name}' by key."
             )
@@ -591,7 +715,7 @@ def _resolve_source(
 ) -> Mapping[str, object]:
     resolved = source() if callable(source) else source
     if not isinstance(resolved, Mapping):
-        raise TypeError("ServiceMap source must resolve to a mapping")
+        raise ServiceMappingError("ServiceMap source must resolve to a mapping")
     return resolved
 
 
@@ -651,7 +775,7 @@ def _expand_definitions(
             continue
 
         if definition.key_template is None:
-            raise RuntimeError(
+            raise ServiceRegistryError(
                 f"Service definition '{definition.origin}' has dict source but no key template."
             )
 
@@ -668,7 +792,7 @@ def _expand_definitions(
             try:
                 static_bound = signature.bind_partial(*static_args, **static_kwargs)
             except TypeError as exc:
-                raise TypeError(
+                raise ServiceMappingError(
                     f"Invalid ServiceMap mapping value for key '{service_key}' in "
                     f"'{definition.origin}': {exc}"
                 ) from exc
@@ -705,7 +829,7 @@ def _resolve_dependency_targets(
             existing_internal_id = public_key_index.get(key)
             if existing_internal_id is not None:
                 first = by_internal_id[existing_internal_id][0]
-                raise RuntimeError(
+                raise ServiceRegistryError(
                     f"Duplicate service key '{key}' from {first.origin} and {definition.origin}."
                 )
             internal_id = key
@@ -755,7 +879,7 @@ def _resolve_dependency_targets(
                 dep_key = dep.target
                 dep_internal_id = public_key_index.get(dep_key)
                 if dep_internal_id is None:
-                    raise RuntimeError(
+                    raise ServiceDependencyError(
                         f"Service '{service_label}' depends on '{dep_key}', but that service is not registered."
                     )
                 resolved_deps.append(
@@ -767,12 +891,12 @@ def _resolve_dependency_targets(
             else:
                 candidate_plan_keys = type_index.get(dep.target, [])
                 if not candidate_plan_keys:
-                    raise RuntimeError(
+                    raise ServiceDependencyError(
                         f"Service '{service_label}' depends on type {dep.target!r}, but no service provides that type."
                     )
                 if len(candidate_plan_keys) > 1:
                     candidate_labels = [_service_label(candidate_id) for candidate_id in candidate_plan_keys]
-                    raise RuntimeError(
+                    raise ServiceDependencyError(
                         "Service "
                         f"'{service_label}' depends on type {dep.target!r}, "
                         f"but multiple services provide it: {candidate_labels}."
@@ -793,7 +917,7 @@ def _resolve_dependency_targets(
                 and target_definition.lifetime == ServiceLifetime.TRANSIENT
                 and not dep.allow_transient
             ):
-                raise RuntimeError(
+                raise ServiceDependencyError(
                     f"Singleton service '{service_label}' depends on transient service '{target_label}'. "
                     "Use Require(..., allow_transient=True) only if this is intentional."
                 )
@@ -868,8 +992,10 @@ def _topological_registration_order(dependency_map: dict[str, set[str]]) -> list
         cycle = _detect_cycle(dependency_map)
         if cycle:
             cycle_path = " -> ".join(cycle)
-            raise RuntimeError(f"Detected circular service dependency: {cycle_path}")
-        raise RuntimeError("Detected circular service dependency")
+            raise CircularServiceDependencyError(
+                f"Detected circular service dependency: {cycle_path}"
+            )
+        raise CircularServiceDependencyError("Detected circular service dependency")
 
     return order
 
@@ -941,7 +1067,7 @@ def _validate_singleton_specs(specs: Sequence[_CompiledService]) -> None:
                 service_label=service_label,
             )
         except TypeError as exc:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Invalid singleton service '{service_label}': {exc}"
             ) from exc
 
@@ -1008,7 +1134,7 @@ def _compose_ctor_call_arguments(
 
     if runtime_positional_values:
         if not has_var_positional:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Service '{service_label}' received too many positional arguments."
             )
         var_positional_values.extend(runtime_positional_values)
@@ -1017,21 +1143,21 @@ def _compose_ctor_call_arguments(
         runtime_param = parameter_map.get(key)
         if runtime_param is None:
             if not has_var_keyword:
-                raise TypeError(
+                raise InvalidServiceDefinitionError(
                     f"Service '{service_label}' got an unexpected keyword argument '{key}'."
                 )
             var_keyword_values[key] = value
             continue
         if runtime_param.kind == inspect.Parameter.POSITIONAL_ONLY:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Service '{service_label}' positional-only parameter '{key}' passed as keyword."
             )
         if runtime_param.kind == inspect.Parameter.VAR_POSITIONAL:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Service '{service_label}' invalid keyword argument for *{key}."
             )
         if key in runtime_positional_assigned:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Service '{service_label}' got multiple values for argument '{key}'."
             )
         if runtime_param.kind == inspect.Parameter.VAR_KEYWORD:
@@ -1050,10 +1176,10 @@ def _compose_ctor_call_arguments(
             values[parameter.name] = parameter.default
             continue
         if parameter.kind == inspect.Parameter.KEYWORD_ONLY:
-            raise TypeError(
+            raise InvalidServiceDefinitionError(
                 f"Service '{service_label}' missing required keyword-only argument '{parameter.name}'."
             )
-        raise TypeError(
+        raise InvalidServiceDefinitionError(
             f"Service '{service_label}' missing required argument '{parameter.name}'."
         )
 
@@ -1139,12 +1265,82 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
     safe_suffix = "".join(ch if ch.isalnum() else "_" for ch in name_suffix).strip("_") or "service"
     _bound_ctor.__name__ = f"autoreg_ctor_{safe_suffix}"
     _bound_ctor.__qualname__ = _bound_ctor.__name__
-    bound_ctor_with_signature = cast(_CallableWithSignature, _bound_ctor)
+    bound_ctor_with_signature = cast(CallableWithSignature, _bound_ctor)
     bound_ctor_with_signature.__signature__ = signature
     annotations = dict(getattr(ctor, "__annotations__", {}))
     annotations["return"] = spec.service_type
     _bound_ctor.__annotations__ = annotations
     return _bound_ctor
+
+
+def _select_unregistered_specs(
+    plan: Sequence[_CompiledService],
+    registered_origins: set[str],
+) -> list[_CompiledService]:
+    return [spec for spec in plan if spec.origin not in registered_origins]
+
+
+def _registered_service_from_spec(spec: _CompiledService) -> RegisteredService:
+    return RegisteredService(
+        key=spec.key,
+        origin=spec.origin,
+        service_type=spec.service_type,
+    )
+
+
+async def _resolve_eager_service(
+    container: ServiceContainer,
+    spec: _CompiledService,
+    *,
+    eager_init_timeout_sec: float | None,
+) -> None:
+    async def _resolve() -> object:
+        if spec.key is not None:
+            return await container.aget_by_key(spec.key)
+        return await container.aget_by_type(spec.service_type)
+
+    if eager_init_timeout_sec is None:
+        await _resolve()
+        return
+    await asyncio.wait_for(_resolve(), timeout=eager_init_timeout_sec)
+
+
+async def _register_compiled_specs(
+    container: ServiceContainer,
+    specs: Sequence[_CompiledService],
+    *,
+    eager_init_timeout_sec: float | None = None,
+    registered_origins: set[str] | None = None,
+) -> list[RegisteredService]:
+    registered_services: list[RegisteredService] = []
+    for spec in specs:
+        await container.register(
+            spec.key,
+            spec.lifetime,
+            _make_bound_ctor(container, spec),
+            spec.dtor,
+        )
+        if spec.eager:
+            await _resolve_eager_service(
+                container,
+                spec,
+                eager_init_timeout_sec=eager_init_timeout_sec,
+            )
+        registered_services.append(_registered_service_from_spec(spec))
+        if registered_origins is not None:
+            registered_origins.add(spec.origin)
+    return registered_services
+
+
+def _merge_global_definitions_into_registry(
+    registry: AppServiceRegistry,
+    *,
+    include_global_registry: bool,
+) -> None:
+    if not include_global_registry:
+        return
+    for definition in get_global_service_definitions():
+        registry.register(definition)
 
 
 async def register_services_from_registry(
@@ -1158,39 +1354,46 @@ async def register_services_from_registry(
         registry=registry,
         include_packages=include_packages,
     )
-    registered_services: list[RegisteredService] = []
-    for spec in plan:
-        bound_ctor = _make_bound_ctor(container, spec)
-        await container.register(
-            spec.key,
-            spec.lifetime,
-            bound_ctor,
-            spec.dtor,
-        )
-        if spec.eager:
-            if spec.key is not None:
-                if eager_init_timeout_sec is not None:
-                    await asyncio.wait_for(
-                        container.aget_by_key(spec.key),
-                        timeout=eager_init_timeout_sec,
-                    )
-                else:
-                    await container.aget_by_key(spec.key)
-            else:
-                if eager_init_timeout_sec is not None:
-                    await asyncio.wait_for(
-                        container.aget_by_type(spec.service_type),
-                        timeout=eager_init_timeout_sec,
-                    )
-                else:
-                    await container.aget_by_type(spec.service_type)
-        registered_services.append(
-            RegisteredService(
-                key=spec.key,
-                origin=spec.origin,
-                service_type=spec.service_type,
-            )
-        )
+    registered_services = await _register_compiled_specs(
+        container,
+        plan,
+        eager_init_timeout_sec=eager_init_timeout_sec,
+    )
+    logger.debug("[LIFESPAN] Auto-registered services count=%s", len(registered_services))
+    return registered_services
 
-    logger.debug("[LIFESPAN] Auto-registered services count=%s", len(plan))
+
+async def refresh_services_for_container(
+    container: ServiceContainer,
+    *,
+    registry: AppServiceRegistry,
+    registered_origins: set[str],
+    include_global_registry: bool,
+    eager_init_timeout_sec: float | None = None,
+) -> list[RegisteredService]:
+    """
+    Refresh container registrations from an app registry and register only new ones.
+
+    When include_global_registry is True, global definitions are merged into the app
+    registry before compiling the incremental registration plan.
+    """
+    _merge_global_definitions_into_registry(
+        registry,
+        include_global_registry=include_global_registry,
+    )
+    plan = build_service_plan(registry=registry)
+    new_specs = _select_unregistered_specs(plan, registered_origins)
+    if not new_specs:
+        return []
+
+    registered_services = await _register_compiled_specs(
+        container,
+        new_specs,
+        eager_init_timeout_sec=eager_init_timeout_sec,
+        registered_origins=registered_origins,
+    )
+    logger.debug(
+        "[LIFESPAN] Runtime refresh registered services count=%s",
+        len(registered_services),
+    )
     return registered_services

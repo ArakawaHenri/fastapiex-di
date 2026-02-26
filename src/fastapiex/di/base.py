@@ -3,7 +3,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from .registry import _DEFAULT_DESTROY_MARKER, Require, Service, ServiceMap
+from .constants import SERVICE_DEFAULT_DESTROY_MARKER
+from .registry import Require, Service, ServiceMap
 
 
 class BaseService(ABC):
@@ -26,7 +27,7 @@ class BaseService(ABC):
         _ = cls
         _ = instance
 
-    setattr(destroy, _DEFAULT_DESTROY_MARKER, True)
+    setattr(destroy, SERVICE_DEFAULT_DESTROY_MARKER, True)
 
 
 __all__ = ["BaseService", "Require", "Service", "ServiceMap"]
