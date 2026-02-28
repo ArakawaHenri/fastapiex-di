@@ -9,18 +9,9 @@ description = "DI extension for FastAPIEx"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
-authors = [
-  { name = "Henri" }
-]
-maintainers = [
-  { name = "Henri" }
-]
-keywords = [
-  "fastapi",
-  "dependency-injection",
-  "service-registry",
-  "asgi",
-]
+authors = [{ name = "Henri" }]
+maintainers = [{ name = "Henri" }]
+keywords = ["fastapi", "dependency-injection", "service-registry", "asgi"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Framework :: AsyncIO",
@@ -35,9 +26,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
   "Typing :: Typed",
 ]
-dependencies = [
-  "fastapi>=0.110,<1.0",
-]
+dependencies = ["fastapi>=0.121,<1.0"]
 
 [project.urls]
 Homepage = "https://github.com/ArakawaHenri/fastapiex-di"
@@ -53,10 +42,7 @@ dev = [
   "pytest-asyncio>=0.23.0",
   "ruff>=0.6.0",
 ]
-security = [
-  "pip-audit>=2.8.0",
-  "cyclonedx-bom>=4.1.0",
-]
+security = ["pip-audit>=2.8.0", "cyclonedx-bom>=4.1.0"]
 
 [tool.uv]
 default-groups = ["dev"]

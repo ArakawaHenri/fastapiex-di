@@ -5,7 +5,8 @@ from typing import cast
 
 import anyio
 import pytest
-from fastapi import BackgroundTasks, FastAPI, WebSocket
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -105,7 +106,7 @@ def test_install_di_stores_service_packages_as_global_paths() -> None:
         assert resolved.exists()
 
 
-def test_install_di_finalizer_runs_after_background_tasks() -> None:
+def test_install_di_transaction_scope_runs_before_background_tasks_and_dtor_runs_after() -> None:
     order: list[str] = []
     set_order_sink(order)
 
@@ -115,7 +116,7 @@ def test_install_di_finalizer_runs_after_background_tasks() -> None:
     @app.get("/order")
     async def order_endpoint(
         background_tasks: BackgroundTasks,
-        _svc=Inject("tracked_transient"),
+        _svc=Inject("tracked_transactional_transient_with_dtor"),
     ):
         background_tasks.add_task(order.append, "background")
         order.append("handler")
@@ -125,7 +126,144 @@ def test_install_di_finalizer_runs_after_background_tasks() -> None:
         with TestClient(app) as client:
             response = client.get("/order")
             assert response.status_code == 200
-        assert order == ["handler", "background", "finalizer"]
+        assert order == [
+            "handler",
+            "commit",
+            "generator-finally",
+            "background",
+            "dtor",
+        ]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_generator_transient_rolls_back_on_httpexception() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.get("/tx-http")
+    async def tx_http(_svc=Inject("tracked_transactional_transient")):
+        raise HTTPException(status_code=400, detail="bad")
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-http")
+            assert response.status_code == 400
+            assert response.json() == {"detail": "bad"}
+        assert order == ["rollback", "finalizer"]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_generator_transient_rolls_back_with_exception_handler() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.exception_handler(KeyError)
+    async def key_error_handler(request: Request, exc: KeyError) -> JSONResponse:
+        _ = request, exc
+        return JSONResponse(status_code=500, content={"handled": True})
+
+    @app.get("/tx-key")
+    async def tx_key(_svc=Inject("tracked_transactional_transient")):
+        raise KeyError("boom")
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-key")
+            assert response.status_code == 500
+            assert response.json() == {"handled": True}
+        assert order == ["rollback", "finalizer"]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_generator_transient_commits_on_raw_400_response() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.get("/tx-raw-400")
+    async def tx_raw_400(_svc=Inject("tracked_transactional_transient")):
+        return JSONResponse(status_code=400, content={"ok": False})
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-raw-400")
+            assert response.status_code == 400
+            assert response.json() == {"ok": False}
+        assert order == ["commit", "finalizer"]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_generator_exit_runs_before_dtor() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.get("/tx-dtor")
+    async def tx_dtor(_svc=Inject("tracked_transactional_transient_with_dtor")):
+        return {"ok": True}
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-dtor")
+            assert response.status_code == 200
+            assert response.json() == {"ok": True}
+        assert order == ["commit", "generator-finally", "dtor"]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_nested_require_generator_transient_commits_on_success() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.get("/tx-nested-ok")
+    async def tx_nested_ok(_svc=Inject("tracked_nested_transactional_consumer")):
+        return {"ok": True}
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-nested-ok")
+            assert response.status_code == 200
+            assert response.json() == {"ok": True}
+        assert order == ["nested-commit", "nested-finalizer"]
+    finally:
+        set_order_sink(None)
+
+
+def test_install_di_nested_require_generator_transient_rolls_back_on_httpexception() -> None:
+    order: list[str] = []
+    set_order_sink(order)
+
+    app = FastAPI()
+    install_di(app, service_packages=["tests.di_test_services"])
+
+    @app.get("/tx-nested-http")
+    async def tx_nested_http(_svc=Inject("tracked_nested_transactional_consumer")):
+        raise HTTPException(status_code=400, detail="bad")
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/tx-nested-http")
+            assert response.status_code == 400
+            assert response.json() == {"detail": "bad"}
+        assert order == ["nested-rollback", "nested-finalizer"]
     finally:
         set_order_sink(None)
 
@@ -219,7 +357,11 @@ def test_install_di_websocket_long_connection_multi_inject_cleanup_order() -> No
     install_di(app, service_packages=["tests.di_test_services"])
 
     @app.websocket("/ws-long")
-    async def ws_endpoint(websocket: WebSocket) -> None:
+    async def ws_endpoint(
+        websocket: WebSocket,
+        _scope=Inject("ping_service"),
+    ) -> None:
+        _ = _scope
         await websocket.accept()
         services = resolve_service_container(websocket.app.state)
         assert services is not None

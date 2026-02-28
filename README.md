@@ -294,7 +294,6 @@ async def nested(
   On unresolved injection, DI always performs one app-local refresh attempt; with this flag enabled, that refresh also merges global definitions.
 - `allow_private_modules` (default `False`): include underscore modules during package scan/import.
   Private modules imported manually at runtime can still register if they belong to configured `service_packages`.
-- `auto_add_finalizer_middleware` (default `True`): auto install transient cleanup middleware.
 - `eager_init_timeout_sec` (optional): timeout for eager singleton initialization.
 
 Recommended production defaults:
@@ -313,8 +312,9 @@ install_di(
 - Container enforces single event-loop usage.
 - Container rejects cross-process reuse.
 - Registry maps container by current process/thread/event-loop context.
-- Transient finalizers run after request completion.
-- Transient finalizers also run after WebSocket connection teardown.
+- Cleanup-requiring transient services must resolve inside an active FastAPI request/WebSocket scope.
+- Transient generator exit runs in a DI-managed function scope (transaction semantics).
+- Transient `destroy()` callbacks run in a DI-managed request scope after response/background completion.
 - Singleton teardown runs on shutdown in reverse order.
 
 ## Supply-Chain Security

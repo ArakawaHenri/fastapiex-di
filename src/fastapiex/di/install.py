@@ -15,11 +15,7 @@ from .constants import (
     APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
     APP_STATE_DI_SERVICE_REGISTRY_ATTR,
 )
-from .container import (
-    ServiceContainer,
-    TransientServiceFinalizerMiddleware,
-    get_or_create_service_container_registry,
-)
+from .container import ServiceContainer, get_or_create_service_container_registry
 from .errors import DIAlreadyInstalledError, DIConfigurationError
 from .registry import (
     AppServiceRegistry,
@@ -43,7 +39,6 @@ class DIConfig:
     strict: bool = True
     use_global_service_registry: bool = False
     allow_private_modules: bool = False
-    auto_add_finalizer_middleware: bool = True
     eager_init_timeout_sec: float | None = None
 
 
@@ -65,14 +60,6 @@ def _normalize_service_packages(service_packages: str | Sequence[str]) -> tuple[
     if not normalized:
         raise DIConfigurationError("install_di() requires at least one service package.")
     return normalized
-
-
-def _has_middleware(app: FastAPI, middleware_cls: type[object]) -> bool:
-    for middleware in app.user_middleware:
-        middleware_spec = middleware
-        if getattr(middleware_spec, "cls", None) is middleware_cls:
-            return True
-    return False
 
 
 def _resolve_runtime_config(config: DIConfig) -> DIConfig:
@@ -159,7 +146,6 @@ def install_di(
     strict: bool = True,
     use_global_service_registry: bool = False,
     allow_private_modules: bool = False,
-    auto_add_finalizer_middleware: bool = True,
     eager_init_timeout_sec: float | None = None,
 ) -> DIConfig:
     """
@@ -181,16 +167,8 @@ def install_di(
         strict=strict,
         use_global_service_registry=use_global_service_registry,
         allow_private_modules=allow_private_modules,
-        auto_add_finalizer_middleware=auto_add_finalizer_middleware,
         eager_init_timeout_sec=eager_init_timeout_sec,
     )
-
-    if config.auto_add_finalizer_middleware and not _has_middleware(
-        app,
-        TransientServiceFinalizerMiddleware,
-    ):
-        # Register cleanup early so user middlewares wrap the full request chain.
-        app.add_middleware(TransientServiceFinalizerMiddleware)
 
     previous_lifespan = app.router.lifespan_context
 

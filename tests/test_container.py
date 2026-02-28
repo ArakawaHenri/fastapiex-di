@@ -1,27 +1,79 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
+from fastapi.params import Depends
 from starlette.requests import Request
 
 from fastapiex.di import Inject, Require, ServiceLifetime
 from fastapiex.di.container import (
-    REQUEST_FAILED_STATE_KEY,
     ServiceContainer,
     ServiceContainerRegistry,
+    _di_cleanup_scope_dependency,
+    _di_transaction_scope_dependency,
     get_or_create_service_container_registry,
     resolve_service_container,
 )
 from fastapiex.di.errors import (
+    ServiceContainerAccessError,
+    ServiceFactoryContractError,
     UnregisteredServiceByKeyError,
     UnregisteredServiceByTypeError,
 )
+
+
+@asynccontextmanager
+async def _build_request_with_scopes(
+    container: ServiceContainer,
+) -> AsyncIterator[tuple[Request, AsyncExitStack, AsyncExitStack]]:
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+        "state": {},
+    }
+    request = Request(scope)
+    transaction_stack = AsyncExitStack()
+    await transaction_stack.__aenter__()
+    cleanup_stack = AsyncExitStack()
+    await cleanup_stack.__aenter__()
+    container._bind_transaction_scope_stack(request, transaction_stack)
+    container._bind_cleanup_scope_stack(request, cleanup_stack)
+    try:
+        yield request, transaction_stack, cleanup_stack
+    except BaseException as exc:
+        container._clear_transaction_scope_stack(request, expected=transaction_stack)
+        container._clear_cleanup_scope_stack(request, expected=cleanup_stack)
+        suppressed = await transaction_stack.__aexit__(
+            type(exc),
+            exc,
+            exc.__traceback__,
+        )
+        await cleanup_stack.__aexit__(None, None, None)
+        if suppressed:
+            return
+        raise
+    else:
+        container._clear_transaction_scope_stack(request, expected=transaction_stack)
+        container._clear_cleanup_scope_stack(request, expected=cleanup_stack)
+        await transaction_stack.__aexit__(None, None, None)
+        await cleanup_stack.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio
@@ -98,6 +150,65 @@ async def test_transient_lifecycle():
     assert call_count == 2
 
 
+def test_inject_uses_cached_hidden_scope_dependencies() -> None:
+    depends_marker = Inject("test")
+    dependency = depends_marker.dependency
+    assert dependency is not None
+
+    signature = inspect.signature(dependency)
+    scope_param = signature.parameters["_di_transaction_scope"]
+    scope_dep = scope_param.default
+
+    assert isinstance(scope_dep, Depends)
+    assert scope_dep.dependency is _di_transaction_scope_dependency
+    assert scope_dep.use_cache is True
+    assert scope_dep.scope == "function"
+
+    transaction_signature = inspect.signature(_di_transaction_scope_dependency)
+    cleanup_param = transaction_signature.parameters["_di_cleanup_scope"]
+    cleanup_dep = cleanup_param.default
+
+    assert isinstance(cleanup_dep, Depends)
+    assert cleanup_dep.dependency is _di_cleanup_scope_dependency
+    assert cleanup_dep.use_cache is True
+    assert cleanup_dep.scope == "request"
+
+
+@pytest.mark.asyncio
+async def test_request_scope_stacks_are_isolated_per_container() -> None:
+    container_a = ServiceContainer()
+    container_b = ServiceContainer()
+    async with _build_request_with_scopes(container_a) as (request, tx_a, cleanup_a):
+        tx_b = AsyncExitStack()
+        cleanup_b = AsyncExitStack()
+        await tx_b.__aenter__()
+        await cleanup_b.__aenter__()
+        container_b._bind_transaction_scope_stack(request, tx_b)
+        container_b._bind_cleanup_scope_stack(request, cleanup_b)
+
+        try:
+            assert container_a._resolve_transaction_scope_stack(request) is tx_a
+            assert container_a._resolve_cleanup_scope_stack(request) is cleanup_a
+            assert container_b._resolve_transaction_scope_stack(request) is tx_b
+            assert container_b._resolve_cleanup_scope_stack(request) is cleanup_b
+
+            container_a._clear_transaction_scope_stack(request, expected=tx_a)
+            container_a._clear_cleanup_scope_stack(request, expected=cleanup_a)
+
+            assert container_a._resolve_transaction_scope_stack(request) is None
+            assert container_a._resolve_cleanup_scope_stack(request) is None
+            assert container_b._resolve_transaction_scope_stack(request) is tx_b
+            assert container_b._resolve_cleanup_scope_stack(request) is cleanup_b
+
+            container_b._clear_transaction_scope_stack(request, expected=tx_b)
+            container_b._clear_cleanup_scope_stack(request, expected=cleanup_b)
+            assert container_b._resolve_transaction_scope_stack(request) is None
+            assert container_b._resolve_cleanup_scope_stack(request) is None
+        finally:
+            await tx_b.__aexit__(None, None, None)
+            await cleanup_b.__aexit__(None, None, None)
+
+
 @pytest.mark.asyncio
 async def test_type_based_injection():
     """Test type-based service injection"""
@@ -146,10 +257,14 @@ async def test_async_generator_service():
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    instance = cast(dict[str, str], await container.aget_by_key("gen"))
-    assert instance["data"] == "test"
+    async with _build_request_with_scopes(container) as (request, _, _):
+        instance = cast(
+            dict[str, str],
+            await container.aget_by_key("gen", **{container.request_kwarg_name(): request}),
+        )
+        assert instance["data"] == "test"
 
-    # Note: In actual usage, cleanup is called automatically at request end
+    assert cleanup_called is True
 
 
 @pytest.mark.asyncio
@@ -446,30 +561,11 @@ async def test_async_generator_transient_finalizer_exhausts_generator():
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "GET",
-        "path": "/",
-        "raw_path": b"/",
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-        "state": {},
-    }
-    request = Request(scope)
-
-    instance = await container.aget_by_key(
-        "gen", **{container.request_kwarg_name(): request}
-    )
-    assert instance == {"ok": True}
-
-    ctx = container._get_or_create_request_ctx(request)
-    for finalizer in reversed(ctx["transient_finalizers"]):
-        await finalizer()
+    async with _build_request_with_scopes(container) as (request, _, _):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == {"ok": True}
 
     assert marks == ["else", "finally"]
 
@@ -493,31 +589,23 @@ async def test_async_generator_transient_finalizer_uses_throw_on_failed_request(
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "GET",
-        "path": "/",
-        "raw_path": b"/",
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-        "state": {},
-    }
-    request = Request(scope)
-    setattr(request.state, REQUEST_FAILED_STATE_KEY, True)
+    async with _build_request_with_scopes(container) as (
+        request,
+        transaction_stack,
+        _,
+    ):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == {"ok": True}
 
-    instance = await container.aget_by_key(
-        "gen", **{container.request_kwarg_name(): request}
-    )
-    assert instance == {"ok": True}
-
-    ctx = container._get_or_create_request_ctx(request)
-    for finalizer in reversed(ctx["transient_finalizers"]):
-        await finalizer()
+        err = RuntimeError("boom")
+        suppressed = await transaction_stack.__aexit__(
+            RuntimeError,
+            err,
+            err.__traceback__,
+        )
+        assert suppressed is False
 
     assert marks == ["except", "finally"]
 
@@ -538,33 +626,72 @@ async def test_async_generator_transient_finalizer_rejects_iterator_style_factor
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "GET",
-        "path": "/",
-        "raw_path": b"/",
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-        "state": {},
-    }
-    request = Request(scope)
+    async with _build_request_with_scopes(container) as (
+        request,
+        transaction_stack,
+        _,
+    ):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == 1
 
-    instance = await container.aget_by_key(
-        "gen", **{container.request_kwarg_name(): request}
-    )
-    assert instance == 1
-
-    ctx = container._get_or_create_request_ctx(request)
-    for finalizer in reversed(ctx["transient_finalizers"]):
-        with pytest.raises(RuntimeError, match="must yield exactly once"):
-            await finalizer()
+        with pytest.raises(ServiceFactoryContractError, match="must yield exactly once"):
+            await transaction_stack.__aexit__(None, None, None)
 
     assert marks == ["finally"]
+
+
+@pytest.mark.asyncio
+async def test_async_generator_transient_requires_di_transaction_scope():
+    container = ServiceContainer()
+
+    async def factory() -> AsyncIterator[dict[str, bool]]:
+        yield {"ok": True}
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    with pytest.raises(ServiceContainerAccessError, match="active DI transaction scope"):
+        await container.aget_by_key("gen")
+
+
+@pytest.mark.asyncio
+async def test_transient_plain_dtor_requires_di_cleanup_scope():
+    container = ServiceContainer()
+
+    async def factory() -> dict[str, bool]:
+        return {"ok": True}
+
+    async def dtor(instance: object) -> None:
+        _ = instance
+
+    await container.register("plain", ServiceLifetime.TRANSIENT, factory, dtor)
+
+    with pytest.raises(ServiceContainerAccessError, match="active DI cleanup scope"):
+        await container.aget_by_key("plain")
+
+
+@pytest.mark.asyncio
+async def test_transient_plain_dtor_logs_and_does_not_escape(caplog) -> None:
+    container = ServiceContainer()
+
+    async def factory() -> dict[str, bool]:
+        return {"ok": True}
+
+    async def dtor(instance: object) -> None:
+        _ = instance
+        raise RuntimeError("dtor boom")
+
+    await container.register("plain", ServiceLifetime.TRANSIENT, factory, dtor)
+
+    with caplog.at_level(logging.ERROR):
+        async with _build_request_with_scopes(container) as (request, _, _):
+            instance = await container.aget_by_key(
+                "plain", **{container.request_kwarg_name(): request}
+            )
+            assert instance == {"ok": True}
+
+    assert "Error running transient destructor for service 'plain'." in caplog.text
 
 
 @pytest.mark.asyncio
@@ -583,31 +710,18 @@ async def test_generator_transient_finalizer_rejects_iterator_style_factory():
 
     await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "GET",
-        "path": "/",
-        "raw_path": b"/",
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 12345),
-        "server": ("testserver", 80),
-        "scheme": "http",
-        "state": {},
-    }
-    request = Request(scope)
+    async with _build_request_with_scopes(container) as (
+        request,
+        transaction_stack,
+        _,
+    ):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == 1
 
-    instance = await container.aget_by_key(
-        "gen", **{container.request_kwarg_name(): request}
-    )
-    assert instance == 1
-
-    ctx = container._get_or_create_request_ctx(request)
-    for finalizer in reversed(ctx["transient_finalizers"]):
-        with pytest.raises(RuntimeError, match="must yield exactly once"):
-            await finalizer()
+        with pytest.raises(ServiceFactoryContractError, match="must yield exactly once"):
+            await transaction_stack.__aexit__(None, None, None)
 
     assert marks == ["finally"]
 

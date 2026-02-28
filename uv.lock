@@ -252,7 +252,7 @@ security = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "fastapi", specifier = ">=0.110,<1.0" }]
+requires-dist = [{ name = "fastapi", specifier = ">=0.121,<1.0" }]
 
 [package.metadata.requires-dev]
 dev = [

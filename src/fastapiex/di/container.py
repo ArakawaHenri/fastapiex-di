@@ -9,7 +9,22 @@ import threading
 import types
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Generator,
+    Iterator,
+)
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from enum import IntEnum
 from typing import (
     Annotated,
@@ -20,9 +35,9 @@ from typing import (
     get_type_hints,
 )
 
+from fastapi.concurrency import contextmanager_in_threadpool
 from fastapi.params import Depends
 from starlette.requests import HTTPConnection
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .constants import (
     APP_STATE_DI_CONFIG_ATTR,
@@ -30,7 +45,6 @@ from .constants import (
     APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
     APP_STATE_DI_SERVICE_REGISTRY_ATTR,
     APP_STATE_SC_REGISTRY_ATTR,
-    REQUEST_FAILED_STATE_KEY,
 )
 from .errors import (
     AmbiguousServiceByTypeError,
@@ -52,6 +66,26 @@ _CURRENT_REQUEST_CTX: contextvars.ContextVar[HTTPConnection | None] = contextvar
     "_svc_current_request",
     default=None,
 )
+_REQUEST_SCOPE_STATE_ATTR = "_fastapiex_di_request_scopes"
+
+
+class _ContainerRequestScopeState:
+    """Per-container request-local DI scope stacks."""
+
+    __slots__ = ("cleanup_stack", "transaction_stack")
+
+    def __init__(self) -> None:
+        self.cleanup_stack: AsyncExitStack | None = None
+        self.transaction_stack: AsyncExitStack | None = None
+
+    def empty(self) -> bool:
+        return self.cleanup_stack is None and self.transaction_stack is None
+
+
+class _RequestScopeStateMap(
+    weakref.WeakKeyDictionary["ServiceContainer", _ContainerRequestScopeState]
+):
+    """Opaque request.state mapping for per-container DI scope state."""
 
 
 class ServiceLifetime(IntEnum):
@@ -597,6 +631,259 @@ class ServiceContainer:
             logger.error(msg)
             raise InvalidServiceDefinitionError(msg) from exc
 
+    def _resolve_request_scope_state_map(
+        self,
+        request: HTTPConnection | None,
+    ) -> _RequestScopeStateMap | None:
+        if request is None:
+            return None
+        scope_state = getattr(request.state, _REQUEST_SCOPE_STATE_ATTR, None)
+        if isinstance(scope_state, _RequestScopeStateMap):
+            return scope_state
+        return None
+
+    def _get_or_create_request_scope_state_map(
+        self,
+        request: HTTPConnection,
+    ) -> _RequestScopeStateMap:
+        scope_state = self._resolve_request_scope_state_map(request)
+        if scope_state is None:
+            scope_state = _RequestScopeStateMap()
+            setattr(request.state, _REQUEST_SCOPE_STATE_ATTR, scope_state)
+        return scope_state
+
+    def _get_or_create_container_request_scope_state(
+        self,
+        request: HTTPConnection,
+    ) -> _ContainerRequestScopeState:
+        state_map = self._get_or_create_request_scope_state_map(request)
+        state = state_map.get(self)
+        if state is None:
+            state = _ContainerRequestScopeState()
+            state_map[self] = state
+        return state
+
+    def _resolve_container_request_scope_state(
+        self,
+        request: HTTPConnection | None,
+    ) -> _ContainerRequestScopeState | None:
+        state_map = self._resolve_request_scope_state_map(request)
+        if state_map is None:
+            return None
+        state = state_map.get(self)
+        if isinstance(state, _ContainerRequestScopeState):
+            return state
+        return None
+
+    def _resolve_cleanup_scope_stack(
+        self,
+        request: HTTPConnection | None,
+    ) -> AsyncExitStack | None:
+        state = self._resolve_container_request_scope_state(request)
+        if state is None:
+            return None
+        stack = state.cleanup_stack
+        if isinstance(stack, AsyncExitStack):
+            return stack
+        return None
+
+    def _resolve_transaction_scope_stack(
+        self,
+        request: HTTPConnection | None,
+    ) -> AsyncExitStack | None:
+        state = self._resolve_container_request_scope_state(request)
+        if state is None:
+            return None
+        stack = state.transaction_stack
+        if isinstance(stack, AsyncExitStack):
+            return stack
+        return None
+
+    def _bind_cleanup_scope_stack(
+        self,
+        request: HTTPConnection,
+        stack: AsyncExitStack,
+    ) -> None:
+        state = self._get_or_create_container_request_scope_state(request)
+        state.cleanup_stack = stack
+
+    def _bind_transaction_scope_stack(
+        self,
+        request: HTTPConnection,
+        stack: AsyncExitStack,
+    ) -> None:
+        state = self._get_or_create_container_request_scope_state(request)
+        state.transaction_stack = stack
+
+    def _clear_cleanup_scope_stack(
+        self,
+        request: HTTPConnection,
+        *,
+        expected: AsyncExitStack | None = None,
+    ) -> None:
+        state_map = self._resolve_request_scope_state_map(request)
+        state = self._resolve_container_request_scope_state(request)
+        if state_map is None or state is None:
+            return
+        current = state.cleanup_stack
+        if expected is not None and current is not expected:
+            return
+        state.cleanup_stack = None
+        if state.empty():
+            state_map.pop(self, None)
+        if not state_map and hasattr(request.state, _REQUEST_SCOPE_STATE_ATTR):
+            delattr(request.state, _REQUEST_SCOPE_STATE_ATTR)
+
+    def _clear_transaction_scope_stack(
+        self,
+        request: HTTPConnection,
+        *,
+        expected: AsyncExitStack | None = None,
+    ) -> None:
+        state_map = self._resolve_request_scope_state_map(request)
+        state = self._resolve_container_request_scope_state(request)
+        if state_map is None or state is None:
+            return
+        current = state.transaction_stack
+        if expected is not None and current is not expected:
+            return
+        state.transaction_stack = None
+        if state.empty():
+            state_map.pop(self, None)
+        if not state_map and hasattr(request.state, _REQUEST_SCOPE_STATE_ATTR):
+            delattr(request.state, _REQUEST_SCOPE_STATE_ATTR)
+
+    def _require_cleanup_scope_stack(
+        self,
+        request: HTTPConnection | None,
+        *,
+        key_label: str,
+    ) -> AsyncExitStack:
+        stack = self._resolve_cleanup_scope_stack(request)
+        if stack is not None:
+            return stack
+        msg = (
+            f"Transient service '{key_label}' requires an active DI cleanup scope. "
+            "Resolve it through Inject(...) before accessing cleanup-managed transients."
+        )
+        logger.error(msg)
+        raise ServiceContainerAccessError(msg)
+
+    def _require_transaction_scope_stack(
+        self,
+        request: HTTPConnection | None,
+        *,
+        key_label: str,
+    ) -> AsyncExitStack:
+        stack = self._resolve_transaction_scope_stack(request)
+        if stack is not None:
+            return stack
+        msg = (
+            f"Transient service '{key_label}' requires an active DI transaction scope. "
+            "Resolve it through Inject(...) before accessing transactional transients."
+        )
+        logger.error(msg)
+        raise ServiceContainerAccessError(msg)
+
+    @staticmethod
+    def _register_transient_dtor_on_stack(
+        *,
+        stack: AsyncExitStack,
+        dtor: Callable[[object], Awaitable[None]],
+        instance: object,
+        key_label: str,
+    ) -> None:
+        async def _run_dtor() -> None:
+            try:
+                await dtor(instance)
+            except Exception:
+                logger.exception(
+                    "Error running transient destructor for service '%s'.",
+                    key_label,
+                )
+
+        stack.push_async_callback(_run_dtor)
+
+    @staticmethod
+    def _wrap_async_generator_result(
+        agen: AsyncGenerator[object, object],
+        *,
+        key_label: str,
+    ) -> AbstractAsyncContextManager[object]:
+        @asynccontextmanager
+        async def _managed() -> AsyncIterator[object]:
+            try:
+                instance = await agen.__anext__()
+            except StopAsyncIteration:
+                raise ServiceFactoryContractError(
+                    f"Async contextmanager service '{key_label}' did not yield a value."
+                ) from None
+
+            try:
+                yield instance
+            except BaseException as exc:
+                try:
+                    await agen.athrow(exc)
+                except StopAsyncIteration:
+                    return
+                except BaseException:
+                    raise
+                raise ServiceFactoryContractError(
+                    f"Async contextmanager service '{key_label}' must yield exactly once."
+                ) from None
+            else:
+                try:
+                    await agen.__anext__()
+                except StopAsyncIteration:
+                    return
+                raise ServiceFactoryContractError(
+                    f"Async contextmanager service '{key_label}' must yield exactly once."
+                )
+            finally:
+                await agen.aclose()
+
+        return _managed()
+
+    @staticmethod
+    def _wrap_generator_result(
+        gen: Generator[object, object, None],
+        *,
+        key_label: str,
+    ) -> AbstractContextManager[object]:
+        @contextmanager
+        def _managed() -> Iterator[object]:
+            try:
+                instance = next(gen)
+            except StopIteration:
+                raise ServiceFactoryContractError(
+                    f"Contextmanager service '{key_label}' did not yield a value."
+                ) from None
+
+            try:
+                yield instance
+            except BaseException as exc:
+                try:
+                    gen.throw(exc)
+                except StopIteration:
+                    return
+                except BaseException:
+                    raise
+                raise ServiceFactoryContractError(
+                    f"Contextmanager service '{key_label}' must yield exactly once."
+                ) from None
+            else:
+                try:
+                    next(gen)
+                except StopIteration:
+                    return
+                raise ServiceFactoryContractError(
+                    f"Contextmanager service '{key_label}' must yield exactly once."
+                )
+            finally:
+                gen.close()
+
+        return _managed()
+
     async def _aget_impl(
             self,
             service: Service,
@@ -608,15 +895,6 @@ class ServiceContainer:
         """
         Core async resolution logic shared by key-based and type-based resolution.
         """
-        class _RequestFailedSignal(Exception):
-            """Internal sentinel to drive contextmanager rollback on failed requests."""
-
-        def _request_failed() -> bool:
-            return (
-                request is not None
-                and bool(getattr(request.state, REQUEST_FAILED_STATE_KEY, False))
-            )
-
         # Enforce single-loop usage for all resolution paths.
         self._ensure_event_loop()
         token = _CURRENT_REQUEST_CTX.set(request)
@@ -641,7 +919,6 @@ class ServiceContainer:
             # Transient resolution.
             ctor = service.ctor
             dtor = service.dtor
-            finalizer: Callable[[], Awaitable[None]] | None = None
 
             # Execute factory: async directly, sync in a background thread to avoid blocking.
             if inspect.iscoroutinefunction(ctor):
@@ -654,134 +931,70 @@ class ServiceContainer:
 
             # Async contextmanager-style factory.
             if inspect.isasyncgen(result):
-                agen = result
-                try:
-                    instance = await agen.__anext__()
-                except StopAsyncIteration:
-                    raise ServiceFactoryContractError(
-                        f"Async contextmanager service '{key_label}' did not yield a value."
-                    ) from None
-
-                async def _close_gen() -> None:
-                    """
-                    Finalize a transient async contextmanager service using
-                    async-contextmanager semantics (exactly one yield).
-
-                    On success, advance once to completion so `else/finally` runs.
-                    On failure, throw an internal signal so `except/finally` runs.
-                    Any additional yielded value is treated as a contract violation.
-                    """
-                    try:
-                        if _request_failed():
-                            signal = _RequestFailedSignal()
-                            try:
-                                await agen.athrow(signal)
-                            except StopAsyncIteration:
-                                return
-                            except _RequestFailedSignal:
-                                return
-                            raise ServiceFactoryContractError(
-                                f"Async contextmanager service '{key_label}' must yield exactly once."
-                            )
-                        try:
-                            await agen.__anext__()
-                        except StopAsyncIteration:
-                            return
-                        raise ServiceFactoryContractError(
-                            f"Async contextmanager service '{key_label}' must yield exactly once."
-                        )
-                    finally:
-                        await agen.aclose()
-
-                if dtor:
-                    logger.warning(
-                        f"Async contextmanager service '{key_label}' should use `async with` or "
-                        f"`yield ... finally` for cleanup instead of a separate destructor."
+                transaction_stack = self._require_transaction_scope_stack(
+                    request,
+                    key_label=key_label,
+                )
+                agen = cast(AsyncGenerator[object, object], result)
+                async_cm = self._wrap_async_generator_result(
+                    agen,
+                    key_label=key_label,
+                )
+                instance = await transaction_stack.enter_async_context(async_cm)
+                if dtor is not None:
+                    cleanup_stack = self._require_cleanup_scope_stack(
+                        request,
+                        key_label=key_label,
                     )
-                    dtor_finalizer = self._make_async_finalizer(dtor, instance)
-
-                    async def _finalizer() -> None:
-                        try:
-                            await dtor_finalizer()
-                        finally:
-                            await _close_gen()
-
-                    finalizer = _finalizer
-                else:
-                    finalizer = _close_gen
+                    self._register_transient_dtor_on_stack(
+                        stack=cleanup_stack,
+                        dtor=dtor,
+                        instance=instance,
+                        key_label=key_label,
+                    )
+                return instance
 
             # Synchronous contextmanager-style factory.
             elif inspect.isgenerator(result):
-                gen = result
-                try:
-                    instance = next(gen)
-                except StopIteration:
-                    msg = f"Contextmanager service '{key_label}' did not yield a value."
-                    logger.error(msg)
-                    raise ServiceFactoryContractError(msg)  # noqa: B904
-
-                async def _close_gen() -> None:
-                    """
-                    Finalize a transient contextmanager service using
-                    contextmanager semantics (exactly one yield).
-
-                    On success, advance once to completion so `else/finally` runs.
-                    On failure, throw an internal signal so `except/finally` runs.
-                    Any additional yielded value is treated as a contract violation.
-                    """
-
-                    def _finalize_gen() -> None:
-                        try:
-                            if _request_failed():
-                                signal = _RequestFailedSignal()
-                                try:
-                                    gen.throw(signal)
-                                except StopIteration:
-                                    return
-                                except _RequestFailedSignal:
-                                    return
-                                raise ServiceFactoryContractError(
-                                    f"Contextmanager service '{key_label}' must yield exactly once."
-                                )
-                            try:
-                                next(gen)
-                            except StopIteration:
-                                return
-                            raise ServiceFactoryContractError(
-                                f"Contextmanager service '{key_label}' must yield exactly once."
-                            )
-                        except _RequestFailedSignal:
-                            return
-                        finally:
-                            gen.close()
-
-                    await asyncio.to_thread(_finalize_gen)
-
-                if dtor:
-                    logger.warning(
-                        f"Contextmanager service '{key_label}' should use `with` or "
-                        f"`yield ... finally` for cleanup instead of a separate destructor."
+                transaction_stack = self._require_transaction_scope_stack(
+                    request,
+                    key_label=key_label,
+                )
+                gen = cast(Generator[object, object, None], result)
+                sync_cm = self._wrap_generator_result(
+                    gen,
+                    key_label=key_label,
+                )
+                instance = await transaction_stack.enter_async_context(
+                    contextmanager_in_threadpool(sync_cm)
+                )
+                if dtor is not None:
+                    cleanup_stack = self._require_cleanup_scope_stack(
+                        request,
+                        key_label=key_label,
                     )
-                    dtor_finalizer = self._make_async_finalizer(dtor, instance)
-
-                    async def _finalizer() -> None:
-                        try:
-                            await dtor_finalizer()
-                        finally:
-                            await _close_gen()
-
-                    finalizer = _finalizer
-                else:
-                    finalizer = _close_gen
+                    self._register_transient_dtor_on_stack(
+                        stack=cleanup_stack,
+                        dtor=dtor,
+                        instance=instance,
+                        key_label=key_label,
+                    )
+                return instance
 
             # Plain object.
             else:
                 instance = result
                 if dtor:
-                    finalizer = self._make_async_finalizer(dtor, instance)
-
-            if finalizer is not None:
-                self._attach_finalizer_to_request(request, finalizer)
+                    cleanup_stack = self._require_cleanup_scope_stack(
+                        request,
+                        key_label=key_label,
+                    )
+                    self._register_transient_dtor_on_stack(
+                        stack=cleanup_stack,
+                        dtor=dtor,
+                        instance=instance,
+                        key_label=key_label,
+                    )
 
             return instance
         finally:
@@ -898,7 +1111,7 @@ class ServiceContainer:
     def request_kwarg_name(self) -> str:
         """
         Name of the keyword argument used when passing the connection object
-        into service-resolution calls, for attaching transient finalizers.
+        into service-resolution calls, for request-scoped cleanup.
         """
         return f"_svc_request_{id(self)}"
 
@@ -907,55 +1120,6 @@ class ServiceContainer:
         Return the currently resolving connection context, if any.
         """
         return _CURRENT_REQUEST_CTX.get()
-
-    def _request_ctx_key(self) -> str:
-        """
-        Name of the attribute on request.state used to store per-request data.
-
-        A unique name based on the container id is used to avoid collisions.
-        """
-        return f"_svc_ctx_{id(self)}"
-
-    def _get_or_create_request_ctx(
-        self,
-        request: HTTPConnection,
-    ) -> dict[str, list[Callable[[], Awaitable[None]]]]:
-        """
-        Return the per-request context dictionary for this container.
-
-        Structure:
-            {
-                "transient_finalizers": list[Callable[[], Awaitable[None]]]
-            }
-        """
-        key = self._request_ctx_key()
-        ctx: dict[str, list[Callable[[], Awaitable[None]]]] | None = getattr(
-            request.state, key, None
-        )
-        if ctx is None:
-            ctx = {"transient_finalizers": []}
-            setattr(request.state, key, ctx)
-        return ctx
-
-    def _attach_finalizer_to_request(
-            self,
-            request: HTTPConnection | None,
-            finalizer: Callable[[], Awaitable[None]],
-    ) -> None:
-        """
-        Attach a transient finalizer to the current request.
-
-        If request is None (e.g. resolution outside a request context),
-        a warning is logged and the finalizer is not tracked.
-        """
-        if request is None:
-            logger.warning(
-                "No request context provided: transient finalizer cannot be attached "
-                "(resource may leak)."
-            )
-            return
-        ctx = self._get_or_create_request_ctx(request)
-        ctx["transient_finalizers"].append(finalizer)
 
     async def aget_by_key(
         self,
@@ -1151,6 +1315,59 @@ def resolve_service_container(app_state: object) -> ServiceContainer | None:
     return None
 
 
+async def _di_cleanup_scope_dependency(request: HTTPConnection) -> AsyncIterator[None]:
+    services = resolve_service_container(getattr(request.app, "state", None))
+    if services is None:
+        msg = (
+            "Service container not initialized for the current event loop on FastAPI app state (sc_registry)."
+        )
+        logger.error(msg)
+        raise ServiceContainerStateError(msg)
+
+    if services._resolve_cleanup_scope_stack(request) is not None:
+        yield
+        return
+
+    async with AsyncExitStack() as cleanup_stack:
+        services._bind_cleanup_scope_stack(request, cleanup_stack)
+        try:
+            yield
+        finally:
+            services._clear_cleanup_scope_stack(request, expected=cleanup_stack)
+
+
+async def _di_transaction_scope_dependency(
+    request: HTTPConnection,
+    _di_cleanup_scope: object = Depends(
+        _di_cleanup_scope_dependency,
+        use_cache=True,
+        scope="request",
+    ),
+) -> AsyncIterator[None]:
+    _ = _di_cleanup_scope
+    services = resolve_service_container(getattr(request.app, "state", None))
+    if services is None:
+        msg = (
+            "Service container not initialized for the current event loop on FastAPI app state (sc_registry)."
+        )
+        logger.error(msg)
+        raise ServiceContainerStateError(msg)
+
+    if services._resolve_transaction_scope_stack(request) is not None:
+        yield
+        return
+
+    async with AsyncExitStack() as transaction_stack:
+        services._bind_transaction_scope_stack(request, transaction_stack)
+        try:
+            yield
+        finally:
+            services._clear_transaction_scope_stack(
+                request,
+                expected=transaction_stack,
+            )
+
+
 def Inject(
         target: str | type[object] | None = None,
         *args: object,
@@ -1194,6 +1411,17 @@ def Inject(
             annotation=HTTPConnection,
         )
     ]
+    params.append(
+        inspect.Parameter(
+            "_di_transaction_scope",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=Depends(
+                _di_transaction_scope_dependency,
+                use_cache=True,
+                scope="function",
+            ),
+        )
+    )
     pos_dep_map: dict[int, str] = {}
     pos_static: dict[int, object] = {}
     kw_dep_map: dict[str, str] = {}
@@ -1329,63 +1557,3 @@ def Inject(
     dependency_callable_with_signature.__signature__ = signature
 
     return Depends(_dependency_callable)
-
-
-class TransientServiceFinalizerMiddleware:
-    """
-    ASGI middleware that runs transient service finalizers at the end of
-    each HTTP request or WebSocket connection.
-
-    This middleware should be added to the ASGI app after all other middlewares
-    that may resolve transient services.
-
-    Usage:
-
-        app.add_middleware(TransientServiceFinalizerMiddleware)
-    """
-
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def _run_finalizers(self, scope: Scope) -> None:
-        app_state = getattr(scope.get("app"), "state", None)
-        services = resolve_service_container(app_state)
-        if services is None:
-            return
-
-        # scope["state"] is a plain dict, not the State wrapper object.
-        # We must use dict operations directly.
-        state = scope.get("state")
-        if state is None:
-            return
-        ctx_key = services._request_ctx_key()
-        ctx = state.get(ctx_key)
-        if not ctx:
-            return
-        finalizers = ctx.get("transient_finalizers", [])
-        for finalizer in reversed(finalizers):
-            try:
-                await finalizer()
-            except Exception:
-                logger.exception("Error running transient finalizer.")
-        # Clean up the context from the state dict
-        state.pop(ctx_key, None)
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] not in ("http", "websocket"):
-            await self.app(scope, receive, send)
-            return
-
-        state = scope.get("state")
-        if state is None:
-            state = {}
-            scope["state"] = state
-
-        try:
-            await self.app(scope, receive, send)
-        except Exception:
-            state[REQUEST_FAILED_STATE_KEY] = True
-            raise
-        finally:
-            # Run finalizers after response background tasks complete.
-            await asyncio.shield(self._run_finalizers(scope))
