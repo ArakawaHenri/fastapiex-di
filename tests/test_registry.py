@@ -254,6 +254,24 @@ def test_eager_transient_is_rejected() -> None:
                 return cls()
 
 
+def test_servicemap_rejects_empty_key_template() -> None:
+    with pytest.raises(ValueError, match="non-empty key template string"):
+        @ServiceMap("", mapping={"alpha": {}})
+        class EmptyKeyTemplateService(BaseService):
+            @classmethod
+            async def create(cls) -> EmptyKeyTemplateService:
+                return cls()
+
+
+def test_servicemap_rejects_non_string_key_template() -> None:
+    with pytest.raises(TypeError, match="non-empty key template string"):
+        @ServiceMap(123, mapping={"alpha": {}})  # type: ignore[arg-type]
+        class NonStringKeyTemplateService(BaseService):
+            @classmethod
+            async def create(cls) -> NonStringKeyTemplateService:
+                return cls()
+
+
 @pytest.mark.asyncio
 async def test_service_decorator_supports_anonymous_registration_defaults() -> None:
     class AnonymousPayloadA:

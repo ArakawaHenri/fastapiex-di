@@ -407,7 +407,7 @@ def _register_service_class(
         raise DIValueError(
             f"Service '{service_cls.__name__}' cannot be eager with transient lifetime."
         )
-    if source is not None and key is None:
+    if source is not None and (not isinstance(key, str) or not key):
         raise DIValueError(
             f"ServiceMap '{service_cls.__name__}' requires a non-empty key template."
         )
@@ -503,6 +503,11 @@ def ServiceMap(
     eager: bool = False,
     exposed_type: object | None = None,
 ) -> Callable[[type[object]], type[object]]:
+    if not isinstance(key, str):
+        raise DITypeError("ServiceMap() expects a non-empty key template string.")
+    if not key:
+        raise DIValueError("ServiceMap() requires a non-empty key template string.")
+
     def _decorator(service_cls: type[object]) -> type[object]:
         return _register_service_class(
             service_cls,
