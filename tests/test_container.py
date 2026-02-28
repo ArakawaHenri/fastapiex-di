@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -265,6 +266,32 @@ async def test_async_generator_service():
         assert instance["data"] == "test"
 
     assert cleanup_called is True
+
+
+@pytest.mark.asyncio
+async def test_async_generator_factory_does_not_use_to_thread(monkeypatch) -> None:
+    container = ServiceContainer()
+    to_thread_calls = 0
+    original_to_thread = asyncio.to_thread
+
+    async def tracked_to_thread(func, /, *args, **kwargs):
+        nonlocal to_thread_calls
+        to_thread_calls += 1
+        return await original_to_thread(func, *args, **kwargs)
+
+    async def factory() -> AsyncIterator[dict[str, bool]]:
+        yield {"ok": True}
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+    monkeypatch.setattr(asyncio, "to_thread", tracked_to_thread)
+
+    async with _build_request_with_scopes(container) as (request, _, _):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == {"ok": True}
+
+    assert to_thread_calls == 0
 
 
 @pytest.mark.asyncio
@@ -724,6 +751,49 @@ async def test_generator_transient_finalizer_rejects_iterator_style_factory():
             await transaction_stack.__aexit__(None, None, None)
 
     assert marks == ["finally"]
+
+
+@pytest.mark.asyncio
+async def test_generator_transient_finalizer_uses_throw_on_cancelled_request():
+    """Cancelled requests should drive sync generators through BaseException rollback path."""
+    container = ServiceContainer()
+    marks: list[str] = []
+
+    def factory():
+        try:
+            yield {"ok": True}
+        except Exception:
+            marks.append("except")
+            raise
+        except BaseException as exc:
+            marks.append(f"base:{type(exc).__name__}")
+            raise
+        else:
+            marks.append("else")
+        finally:
+            marks.append("finally")
+
+    await container.register("gen", ServiceLifetime.TRANSIENT, factory, None)
+
+    async with _build_request_with_scopes(container) as (
+        request,
+        transaction_stack,
+        _,
+    ):
+        instance = await container.aget_by_key(
+            "gen", **{container.request_kwarg_name(): request}
+        )
+        assert instance == {"ok": True}
+
+        err = asyncio.CancelledError()
+        suppressed = await transaction_stack.__aexit__(
+            asyncio.CancelledError,
+            err,
+            err.__traceback__,
+        )
+        assert suppressed is False
+
+    assert marks == ["base:CancelledError", "finally"]
 
 
 @pytest.mark.asyncio

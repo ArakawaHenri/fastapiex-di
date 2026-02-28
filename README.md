@@ -251,6 +251,9 @@ class UserQueryServiceT(BaseService):
 
 ## Injecting Services in FastAPI Endpoints
 
+`Inject(...)` requires an explicit target. Pass either a registered service key
+or a service type. `Inject()` with no arguments is invalid.
+
 ### Key-based
 
 ```python

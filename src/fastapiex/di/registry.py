@@ -10,6 +10,7 @@ import os
 import pkgutil
 import sys
 import threading
+import weakref
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -153,7 +154,6 @@ class RegisteredService:
 
 @dataclass(frozen=True)
 class _RuntimeRegistryBinding:
-    registry: AppServiceRegistry
     package_paths: tuple[str, ...]
     use_global_service_registry: bool
 
@@ -195,7 +195,10 @@ class AppServiceRegistry:
 
 
 _GLOBAL_SERVICE_REGISTRY = AppServiceRegistry()
-_RUNTIME_REGISTRY_BINDINGS: dict[int, _RuntimeRegistryBinding] = {}
+_RUNTIME_REGISTRY_BINDINGS: weakref.WeakKeyDictionary[
+    AppServiceRegistry,
+    _RuntimeRegistryBinding,
+] = weakref.WeakKeyDictionary()
 _RUNTIME_REGISTRY_BINDINGS_LOCK = threading.Lock()
 
 
@@ -248,25 +251,27 @@ def register_runtime_registry_binding(
         for path in package_paths
     )
     binding = _RuntimeRegistryBinding(
-        registry=registry,
         package_paths=normalized_paths,
         use_global_service_registry=use_global_service_registry,
     )
     with _RUNTIME_REGISTRY_BINDINGS_LOCK:
-        _RUNTIME_REGISTRY_BINDINGS[id(registry)] = binding
+        _RUNTIME_REGISTRY_BINDINGS[registry] = binding
 
 
 def unregister_runtime_registry_binding(registry: AppServiceRegistry) -> None:
     with _RUNTIME_REGISTRY_BINDINGS_LOCK:
-        _RUNTIME_REGISTRY_BINDINGS.pop(id(registry), None)
+        _RUNTIME_REGISTRY_BINDINGS.pop(registry, None)
 
 
-def _runtime_registry_bindings_snapshot() -> tuple[tuple[_RuntimeRegistryBinding, ...], bool]:
+def _runtime_registry_bindings_snapshot() -> tuple[
+    tuple[tuple[AppServiceRegistry, _RuntimeRegistryBinding], ...],
+    bool,
+]:
     with _RUNTIME_REGISTRY_BINDINGS_LOCK:
-        bindings = tuple(_RUNTIME_REGISTRY_BINDINGS.values())
+        bindings = tuple(_RUNTIME_REGISTRY_BINDINGS.items())
     maintain_global = any(
         binding.use_global_service_registry
-        for binding in bindings
+        for _, binding in bindings
     )
     return bindings, maintain_global
 
@@ -319,10 +324,10 @@ def _register_definition_into_runtime_registries(
 ) -> None:
     bindings, maintain_global = _runtime_registry_bindings_snapshot()
     matched = False
-    for binding in bindings:
+    for registry, binding in bindings:
         if not _definition_matches_package_paths(definition, binding.package_paths):
             continue
-        binding.registry.register(definition)
+        registry.register(definition)
         matched = True
 
     if not matched and maintain_global:

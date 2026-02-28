@@ -20,10 +20,8 @@ from collections.abc import (
 )
 from contextlib import (
     AbstractAsyncContextManager,
-    AbstractContextManager,
     AsyncExitStack,
     asynccontextmanager,
-    contextmanager,
 )
 from enum import IntEnum
 from typing import (
@@ -35,7 +33,6 @@ from typing import (
     get_type_hints,
 )
 
-from fastapi.concurrency import contextmanager_in_threadpool
 from fastapi.params import Depends
 from starlette.requests import HTTPConnection
 
@@ -67,6 +64,7 @@ _CURRENT_REQUEST_CTX: contextvars.ContextVar[HTTPConnection | None] = contextvar
     default=None,
 )
 _REQUEST_SCOPE_STATE_ATTR = "_fastapiex_di_request_scopes"
+_SYNC_GENERATOR_NO_VALUE = object()
 
 
 class _ContainerRequestScopeState:
@@ -727,6 +725,9 @@ class ServiceContainer:
             return
         current = state.cleanup_stack
         if expected is not None and current is not expected:
+            logger.warning(
+                "Cleanup scope stack mismatch on clear; keeping current stack binding."
+            )
             return
         state.cleanup_stack = None
         if state.empty():
@@ -746,6 +747,9 @@ class ServiceContainer:
             return
         current = state.transaction_stack
         if expected is not None and current is not expected:
+            logger.warning(
+                "Transaction scope stack mismatch on clear; keeping current stack binding."
+            )
             return
         state.transaction_stack = None
         if state.empty():
@@ -845,16 +849,43 @@ class ServiceContainer:
         return _managed()
 
     @staticmethod
-    def _wrap_generator_result(
+    def _advance_sync_generator(
+        gen: Generator[object, object, None],
+    ) -> object:
+        try:
+            return next(gen)
+        except StopIteration:
+            return _SYNC_GENERATOR_NO_VALUE
+
+    @staticmethod
+    def _throw_sync_generator(
+        gen: Generator[object, object, None],
+        exc: BaseException,
+    ) -> object:
+        try:
+            return gen.throw(exc)
+        except StopIteration:
+            return _SYNC_GENERATOR_NO_VALUE
+
+    @staticmethod
+    def _wrap_sync_generator_result(
         gen: Generator[object, object, None],
         *,
         key_label: str,
-    ) -> AbstractContextManager[object]:
-        @contextmanager
-        def _managed() -> Iterator[object]:
+    ) -> AbstractAsyncContextManager[object]:
+        @asynccontextmanager
+        async def _managed() -> AsyncIterator[object]:
             try:
-                instance = next(gen)
-            except StopIteration:
+                instance = await asyncio.to_thread(
+                    ServiceContainer._advance_sync_generator,
+                    gen,
+                )
+            except Exception:
+                await asyncio.to_thread(gen.close)
+                raise
+
+            if instance is _SYNC_GENERATOR_NO_VALUE:
+                await asyncio.to_thread(gen.close)
                 raise ServiceFactoryContractError(
                     f"Contextmanager service '{key_label}' did not yield a value."
                 ) from None
@@ -863,24 +894,30 @@ class ServiceContainer:
                 yield instance
             except BaseException as exc:
                 try:
-                    gen.throw(exc)
-                except StopIteration:
-                    return
+                    result = await asyncio.to_thread(
+                        ServiceContainer._throw_sync_generator,
+                        gen,
+                        exc,
+                    )
                 except BaseException:
                     raise
+                if result is _SYNC_GENERATOR_NO_VALUE:
+                    return
                 raise ServiceFactoryContractError(
                     f"Contextmanager service '{key_label}' must yield exactly once."
                 ) from None
             else:
-                try:
-                    next(gen)
-                except StopIteration:
+                result = await asyncio.to_thread(
+                    ServiceContainer._advance_sync_generator,
+                    gen,
+                )
+                if result is _SYNC_GENERATOR_NO_VALUE:
                     return
                 raise ServiceFactoryContractError(
                     f"Contextmanager service '{key_label}' must yield exactly once."
                 )
             finally:
-                gen.close()
+                await asyncio.to_thread(gen.close)
 
         return _managed()
 
@@ -923,6 +960,8 @@ class ServiceContainer:
             # Execute factory: async directly, sync in a background thread to avoid blocking.
             if inspect.iscoroutinefunction(ctor):
                 result = await ctor(*args, **kwargs)
+            elif inspect.isasyncgenfunction(ctor):
+                result = ctor(*args, **kwargs)
             else:
                 # Run sync factories in a separate thread to avoid blocking the loop.
                 result = await asyncio.to_thread(ctor, *args, **kwargs)
@@ -961,13 +1000,11 @@ class ServiceContainer:
                     key_label=key_label,
                 )
                 gen = cast(Generator[object, object, None], result)
-                sync_cm = self._wrap_generator_result(
+                async_cm = self._wrap_sync_generator_result(
                     gen,
                     key_label=key_label,
                 )
-                instance = await transaction_stack.enter_async_context(
-                    contextmanager_in_threadpool(sync_cm)
-                )
+                instance = await transaction_stack.enter_async_context(async_cm)
                 if dtor is not None:
                     cleanup_stack = self._require_cleanup_scope_stack(
                         request,
@@ -1369,12 +1406,16 @@ async def _di_transaction_scope_dependency(
 
 
 def Inject(
-        target: str | type[object] | None = None,
+        target: str | type[object],
         *args: object,
         **kwargs: object,
 ) -> Depends:
     """
     Create a FastAPI dependency marker for a registered service.
+
+    `target` is required and must be either:
+    - a service key string, or
+    - a service type used for unique type-based lookup.
 
     In endpoints you can write:
 
@@ -1391,6 +1432,8 @@ def Inject(
         - Inject(MyType)
 
        This requires that exactly one service of type MyType is registered.
+
+    Calling `Inject()` without a target is not supported.
     """
     lookup_value: str | type[object]
     if isinstance(target, str):
