@@ -2,30 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from fastapi import FastAPI
 
+from .activator import register_services_from_registry
 from .constants import (
     APP_STATE_DI_CONFIG_ATTR,
     APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR,
     APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
     APP_STATE_DI_SERVICE_REGISTRY_ATTR,
 )
-from .container import ServiceContainer, get_or_create_service_container_registry
+from .container import ServiceContainer
+from .discovery import (
+    import_service_modules,
+    register_module_service_definitions,
+    resolve_service_package_paths,
+)
 from .errors import DIAlreadyInstalledError, DIConfigurationError
+from .injection import ServiceContainerRegistry, get_or_create_service_container_registry
 from .registry import (
     AppServiceRegistry,
     capture_service_registrations,
     get_global_service_definitions,
-    import_service_modules,
-    register_module_service_definitions,
     register_runtime_registry_binding,
-    register_services_from_registry,
-    resolve_service_package_paths,
     unregister_runtime_registry_binding,
 )
 
@@ -175,7 +178,7 @@ def install_di(
     @asynccontextmanager
     async def _combined_lifespan(inner_app: FastAPI) -> AsyncIterator[None]:
         services: ServiceContainer | None = None
-        sc_registry = None
+        sc_registry: ServiceContainerRegistry | None = None
         app_service_registry: AppServiceRegistry | None = None
         binding_registered = False
         runtime_config = config

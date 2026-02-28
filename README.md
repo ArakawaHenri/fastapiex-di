@@ -320,6 +320,24 @@ install_di(
 - Transient `destroy()` callbacks run in a DI-managed request scope after response/background completion.
 - Singleton teardown runs on shutdown in reverse order.
 
+## Module Layout
+
+The package is split by responsibility:
+
+```text
+fastapiex/di/
+├── __init__.py       # Stable public API facade for most applications
+├── container.py      # Low-level ServiceContainer runtime only
+├── injection.py      # FastAPI integration (Inject, request scopes, container registry lookup)
+├── registry.py       # Service definition models and registration decorators
+├── discovery.py      # Module/package scanning helpers
+├── planner.py        # Registry-to-plan compilation helpers
+├── activator.py      # Register compiled plans into a container
+└── bootstrap.py      # FastAPI startup/shutdown wiring (install_di, DIConfig)
+```
+
+Prefer importing from `fastapiex.di` unless you explicitly need advanced control.
+
 ## Supply-Chain Security
 
 Install security tooling group:
@@ -366,8 +384,14 @@ Advanced APIs are available from submodules:
 
 ```python
 from fastapiex.di.container import ServiceContainer
+from fastapiex.di.injection import (
+    ServiceContainerRegistry,
+    resolve_service_container,
+)
 from fastapiex.di.registry import (
     AppServiceRegistry,
     capture_service_registrations,
 )
+from fastapiex.di.planner import build_service_plan
+from fastapiex.di.activator import register_services_from_registry
 ```

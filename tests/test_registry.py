@@ -12,14 +12,13 @@ from fastapiex.di import (
     ServiceLifetime,
     ServiceMap,
 )
+from fastapiex.di.activator import register_services_from_registry
 from fastapiex.di.container import ServiceContainer
+from fastapiex.di.planner import _topological_registration_order, build_service_plan
 from fastapiex.di.registry import (
     AppServiceRegistry,
     RegisteredService,
-    _topological_registration_order,
-    build_service_plan,
     capture_service_registrations,
-    register_services_from_registry,
 )
 
 

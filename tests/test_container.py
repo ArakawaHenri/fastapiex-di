@@ -15,8 +15,8 @@ from fastapi.params import Depends
 from starlette.requests import Request
 
 from fastapiex.di import Inject, Require, ServiceLifetime
-from fastapiex.di.container import (
-    ServiceContainer,
+from fastapiex.di.container import ServiceContainer
+from fastapiex.di.injection import (
     ServiceContainerRegistry,
     _di_cleanup_scope_dependency,
     _di_transaction_scope_dependency,

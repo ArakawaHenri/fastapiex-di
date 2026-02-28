@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from fastapiex.di import Inject, ServiceLifetime, install_di
-from fastapiex.di.container import resolve_service_container
+from fastapiex.di.injection import resolve_service_container
 from tests.di_test_services.helpers import set_order_sink
 
 
