@@ -7,7 +7,6 @@ from collections.abc import Sequence
 from typing import cast
 
 from .container import ServiceContainer
-from .contracts import CallableWithSignature, Ctor
 from .planner import _compose_ctor_call_arguments, build_service_plan
 from .registry import (
     AppServiceRegistry,
@@ -16,6 +15,7 @@ from .registry import (
     _CompiledService,
     get_global_service_definitions,
 )
+from .types import CallableWithSignature, Ctor
 
 logger = logging.getLogger(__name__)
 

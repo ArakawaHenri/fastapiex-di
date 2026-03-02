@@ -1,7 +1,6 @@
 from .base import BaseService
 from .bootstrap import install_di
-from .contracts import ServiceLifetime
-from .errors import (
+from .exceptions import (
     AmbiguousServiceByTypeError,
     DIAlreadyInstalledError,
     DIConfigurationError,
@@ -24,6 +23,7 @@ from .errors import (
 )
 from .injection import Inject
 from .registry import Require, Service, ServiceMap
+from .types import ServiceLifetime
 
 __all__ = [
     "AmbiguousServiceByTypeError",

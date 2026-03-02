@@ -23,7 +23,7 @@ from fastapiex.di.injection import (
     get_or_create_service_container_registry,
     resolve_service_container,
 )
-from fastapiex.di.errors import (
+from fastapiex.di.exceptions import (
     ServiceContainerAccessError,
     ServiceFactoryContractError,
     UnregisteredServiceByKeyError,

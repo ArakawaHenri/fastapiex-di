@@ -327,6 +327,8 @@ The package is split by responsibility:
 ```text
 fastapiex/di/
 ├── __init__.py       # Stable public API facade for most applications
+├── types.py          # Shared enums, protocols, and type aliases
+├── exceptions.py     # Package-defined DI exception hierarchy
 ├── container.py      # Low-level ServiceContainer runtime only
 ├── injection.py      # FastAPI integration (Inject, request scopes, container registry lookup)
 ├── registry.py       # Service definition models and registration decorators
@@ -354,7 +356,7 @@ Run checks:
 
 ## Common Errors
 
-- DI-defined API/runtime exceptions are custom (`fastapiex.di.errors.*`) and inherit `DIError`.
+- DI-defined API/runtime exceptions are custom (`fastapiex.di.exceptions.*`) and inherit `DIError`.
   Import-time failures from Python (for example `ModuleNotFoundError` from invalid `service_packages`) can still bubble up.
 - `Duplicate service registration for key`: same key registered more than once.
 - `No service registered for type`: missing provider for type-based injection.

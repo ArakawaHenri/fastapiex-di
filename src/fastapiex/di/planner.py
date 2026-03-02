@@ -6,8 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 
 from .container import ServiceContainer
-from .contracts import ServiceLifetime
-from .errors import (
+from .exceptions import (
     CircularServiceDependencyError,
     InvalidServiceDefinitionError,
     ServiceDependencyError,
@@ -24,6 +23,7 @@ from .registry import (
     _is_origin_included,
     _ResolvedDependency,
 )
+from .types import ServiceLifetime
 
 
 def _render_service_key(key_template: str, dict_key: str) -> str:

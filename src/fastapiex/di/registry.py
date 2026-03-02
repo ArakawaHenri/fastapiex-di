@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from typing import Literal, TypeVar, cast, overload
 
 from .constants import SERVICE_DEFAULT_DESTROY_MARKER, SERVICE_DEFINITION_ATTR
-from .contracts import Ctor, Dtor, ServiceLifetime
-from .errors import DITypeError, DIValueError, InvalidServiceDefinitionError
+from .exceptions import DITypeError, DIValueError, InvalidServiceDefinitionError
+from .types import Ctor, Dtor, ServiceLifetime
 
 logger = logging.getLogger(__name__)
 

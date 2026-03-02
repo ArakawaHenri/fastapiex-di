@@ -32,8 +32,7 @@ from typing import (
 
 from starlette.requests import HTTPConnection
 
-from .contracts import Ctor, Dtor, ServiceLifetime
-from .errors import (
+from .exceptions import (
     AmbiguousServiceByTypeError,
     DuplicateServiceRegistrationError,
     InvalidServiceDefinitionError,
@@ -44,6 +43,7 @@ from .errors import (
     UnregisteredServiceByKeyError,
     UnregisteredServiceByTypeError,
 )
+from .types import Ctor, Dtor, ServiceLifetime
 
 logger = logging.getLogger(__name__)
 

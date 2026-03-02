@@ -9,7 +9,7 @@ import sys
 from collections.abc import Sequence
 
 from .constants import SERVICE_DEFINITION_ATTR
-from .errors import DIValueError
+from .exceptions import DIValueError
 from .registry import AppServiceRegistry, _is_origin_included, _ServiceDefinition
 
 

@@ -22,7 +22,7 @@ from .discovery import (
     register_module_service_definitions,
     resolve_service_package_paths,
 )
-from .errors import DIAlreadyInstalledError, DIConfigurationError
+from .exceptions import DIAlreadyInstalledError, DIConfigurationError
 from .injection import ServiceContainerRegistry, get_or_create_service_container_registry
 from .registry import (
     AppServiceRegistry,

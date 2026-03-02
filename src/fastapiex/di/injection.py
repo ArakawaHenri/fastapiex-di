@@ -22,12 +22,12 @@ from .constants import (
     APP_STATE_SC_REGISTRY_ATTR,
 )
 from .container import ServiceContainer
-from .contracts import CallableWithSignature
-from .errors import (
+from .exceptions import (
     InvalidServiceDefinitionError,
     ServiceContainerStateError,
     UnregisteredServiceError,
 )
+from .types import CallableWithSignature
 
 logger = logging.getLogger(__name__)
 

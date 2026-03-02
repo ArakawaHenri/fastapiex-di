@@ -10,7 +10,7 @@ import pytest
 
 from fastapiex.di import Inject
 from fastapiex.di.container import ServiceContainer
-from fastapiex.di.errors import InvalidServiceDefinitionError
+from fastapiex.di.exceptions import InvalidServiceDefinitionError
 from fastapiex.di.registry import (
     AppServiceRegistry,
     _runtime_registry_bindings_snapshot,
