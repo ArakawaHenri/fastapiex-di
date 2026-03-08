@@ -8,6 +8,7 @@ import threading
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 from fastapi.params import Depends
@@ -16,9 +17,6 @@ from starlette.requests import HTTPConnection
 from .activator import refresh_services_for_container
 from .constants import (
     APP_STATE_DI_CONFIG_ATTR,
-    APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR,
-    APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
-    APP_STATE_DI_SERVICE_REGISTRY_ATTR,
     APP_STATE_SC_REGISTRY_ATTR,
 )
 from .container import ServiceContainer
@@ -27,9 +25,18 @@ from .exceptions import (
     ServiceContainerStateError,
     UnregisteredServiceError,
 )
+from .registry import AppServiceRegistry
 from .types import CallableWithSignature
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ServiceContainerContext:
+    container: ServiceContainer
+    service_registry: AppServiceRegistry | None = None
+    registered_service_ids: set[str] = field(default_factory=set)
+    refresh_lock: asyncio.Lock | None = None
 
 
 class ServiceContainerRegistry:
@@ -42,7 +49,10 @@ class ServiceContainerRegistry:
     """
 
     def __init__(self) -> None:
-        self._containers: dict[tuple[int, int, int], ServiceContainer] = {}
+        self._contexts: dict[
+            tuple[int, int, int],
+            _ServiceContainerContext,
+        ] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -53,12 +63,13 @@ class ServiceContainerRegistry:
     def register_current(self, container: ServiceContainer) -> tuple[int, int, int]:
         key = self._current_key()
         with self._lock:
-            existing = self._containers.get(key)
-            if existing is not None and existing is not container:
+            existing = self._contexts.get(key)
+            if existing is not None and existing.container is not container:
                 raise ServiceContainerStateError(
                     "A different ServiceContainer is already registered for the current event loop."
                 )
-            self._containers[key] = container
+            if existing is None:
+                self._contexts[key] = _ServiceContainerContext(container=container)
         return key
 
     def get_current(self) -> ServiceContainer | None:
@@ -67,7 +78,34 @@ class ServiceContainerRegistry:
         except RuntimeError:
             return None
         with self._lock:
-            return self._containers.get(key)
+            context = self._contexts.get(key)
+            return context.container if context is not None else None
+
+    def get_current_context(self) -> _ServiceContainerContext | None:
+        try:
+            key = self._current_key()
+        except RuntimeError:
+            return None
+        with self._lock:
+            return self._contexts.get(key)
+
+    def bind_current_runtime_state(
+        self,
+        *,
+        service_registry: AppServiceRegistry,
+        registered_service_ids: set[str],
+        refresh_lock: asyncio.Lock,
+    ) -> None:
+        key = self._current_key()
+        with self._lock:
+            context = self._contexts.get(key)
+            if context is None:
+                raise ServiceContainerStateError(
+                    "Cannot bind DI runtime state before registering the current ServiceContainer."
+                )
+            context.service_registry = service_registry
+            context.registered_service_ids = registered_service_ids
+            context.refresh_lock = refresh_lock
 
     def unregister_current(
         self,
@@ -79,15 +117,17 @@ class ServiceContainerRegistry:
         except RuntimeError:
             return None
         with self._lock:
-            existing = self._containers.get(key)
-            if existing is None:
+            context = self._contexts.get(key)
+            if context is None:
                 return None
+            existing = context.container
             if expected is not None and existing is not expected:
                 logger.warning(
                     "ServiceContainer registry mismatch on unregister; keeping current mapping."
                 )
                 return None
-            return self._containers.pop(key)
+            self._contexts.pop(key)
+            return existing
 
 
 _APP_STATE_REGISTRY_LOCK = threading.Lock()
@@ -130,6 +170,18 @@ def resolve_service_container(app_state: object) -> ServiceContainer | None:
     registry = getattr(app_state, APP_STATE_SC_REGISTRY_ATTR, None)
     if isinstance(registry, ServiceContainerRegistry):
         return registry.get_current()
+    return None
+
+
+def resolve_service_container_context(
+    app_state: object,
+) -> _ServiceContainerContext | None:
+    if app_state is None:
+        return None
+
+    registry = getattr(app_state, APP_STATE_SC_REGISTRY_ATTR, None)
+    if isinstance(registry, ServiceContainerRegistry):
+        return registry.get_current_context()
     return None
 
 
@@ -296,21 +348,23 @@ def Inject(
     ) -> bool:
         app_state = getattr(request.app, "state", None)
         di_config = getattr(app_state, APP_STATE_DI_CONFIG_ATTR, None)
-        app_service_registry = getattr(app_state, APP_STATE_DI_SERVICE_REGISTRY_ATTR, None)
-        registered_origins = getattr(
-            app_state,
-            APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
-            None,
-        )
-        refresh_lock = getattr(app_state, APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR, None)
-        if app_service_registry is None or not isinstance(registered_origins, set):
+        container_context = resolve_service_container_context(app_state)
+        if (
+            container_context is None
+            or container_context.container is not services
+            or container_context.service_registry is None
+            or container_context.refresh_lock is None
+        ):
             return False
+        app_service_registry = container_context.service_registry
+        registered_service_ids = container_context.registered_service_ids
+        refresh_lock = container_context.refresh_lock
 
         async def _run_refresh() -> None:
             await refresh_services_for_container(
                 services,
                 registry=app_service_registry,
-                registered_origins=registered_origins,
+                registered_service_ids=registered_service_ids,
                 include_global_registry=bool(
                     getattr(di_config, "use_global_service_registry", False)
                 ),
@@ -321,10 +375,7 @@ def Inject(
                 ),
             )
 
-        if isinstance(refresh_lock, asyncio.Lock):
-            async with refresh_lock:
-                await _run_refresh()
-        else:
+        async with refresh_lock:
             await _run_refresh()
         return True
 

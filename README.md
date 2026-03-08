@@ -296,7 +296,7 @@ async def nested(
 - `use_global_service_registry` (default `False`): maintain a global registry for services declared outside all configured `service_packages`.
   On unresolved injection, DI always performs one app-local refresh attempt; with this flag enabled, that refresh also merges global definitions.
 - `allow_private_modules` (default `False`): include underscore modules during package scan/import.
-  Private modules imported manually at runtime can still register if they belong to configured `service_packages`.
+  Private modules imported manually can still register if they belong to configured `service_packages`; once imported, later worker/app startups in the same process also reuse those definitions without forcing private-module scans.
 - `eager_init_timeout_sec` (optional): timeout for eager singleton initialization.
 
 Recommended production defaults:

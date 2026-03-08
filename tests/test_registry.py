@@ -12,7 +12,10 @@ from fastapiex.di import (
     ServiceLifetime,
     ServiceMap,
 )
-from fastapiex.di.activator import register_services_from_registry
+from fastapiex.di.activator import (
+    refresh_services_for_container,
+    register_services_from_registry,
+)
 from fastapiex.di.container import ServiceContainer
 from fastapiex.di.planner import _topological_registration_order, build_service_plan
 from fastapiex.di.registry import (
@@ -580,6 +583,68 @@ def test_servicemap_explicit_value_overrides_require_dependency_edge() -> None:
     by_key = {spec.key: spec for spec in plan}
     consumer_spec = by_key["alpha_consumer"]
     assert consumer_spec.dependencies == ()
+
+
+def test_servicemap_uses_snapshot_when_mapping_items_mutates_during_iteration() -> None:
+    class MutatingItemsDict(dict[str, object]):
+        def items(self):  # type: ignore[override]
+            inner = super().items()
+            mutated = False
+            for item in inner:
+                if not mutated:
+                    self["gamma"] = {"name": "c"}
+                    mutated = True
+                yield item
+
+    registry = AppServiceRegistry()
+    unstable_mapping = MutatingItemsDict(
+        {
+            "alpha": {"name": "a"},
+            "beta": {"name": "b"},
+        }
+    )
+
+    with _capture_here(registry):
+        @ServiceMap("{}_svc", mapping=unstable_mapping)
+        class SnapshotMapService(BaseService):
+            @classmethod
+            async def create(cls, name: str) -> SnapshotMapService:
+                _ = name
+                return cls()
+
+    plan = build_service_plan(registry=registry)
+    keys = {spec.key for spec in plan}
+    assert "alpha_svc" in keys
+    assert "beta_svc" in keys
+
+
+@pytest.mark.asyncio
+async def test_servicemap_refresh_registers_new_runtime_entries() -> None:
+    registry = AppServiceRegistry()
+    mapping = {"alpha": {"name": "a"}}
+
+    with _capture_here(registry):
+        @ServiceMap("{}_svc", mapping=lambda: mapping)
+        class RuntimeMapService(BaseService):
+            @classmethod
+            async def create(cls, name: str) -> dict[str, str]:
+                _ = cls
+                return {"name": name}
+
+    container = ServiceContainer()
+    registered = await register_services_from_registry(container, registry=registry)
+    registered_ids = {item.registration_id for item in registered}
+
+    mapping["beta"] = {"name": "b"}
+    refreshed = await refresh_services_for_container(
+        container,
+        registry=registry,
+        registered_service_ids=registered_ids,
+        include_global_registry=False,
+    )
+
+    assert {item.key for item in refreshed} == {"beta_svc"}
+    assert await container.aget_by_key("beta_svc") == {"name": "b"}
 
 
 @pytest.mark.asyncio

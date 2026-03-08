@@ -114,6 +114,7 @@ class _ResolvedDependency:
 class _CompiledService:
     origin: str
     internal_id: str
+    registration_id: str
     key: str | None
     lifetime: ServiceLifetime
     eager: bool
@@ -128,6 +129,7 @@ class _CompiledService:
 
 @dataclass(frozen=True)
 class RegisteredService:
+    registration_id: str
     key: str | None
     origin: str
     service_type: object
@@ -175,12 +177,24 @@ class AppServiceRegistry:
             ]
 
 
+_KNOWN_SERVICE_REGISTRY = AppServiceRegistry()
 _GLOBAL_SERVICE_REGISTRY = AppServiceRegistry()
 _RUNTIME_REGISTRY_BINDINGS: weakref.WeakKeyDictionary[
     AppServiceRegistry,
     _RuntimeRegistryBinding,
 ] = weakref.WeakKeyDictionary()
 _RUNTIME_REGISTRY_BINDINGS_LOCK = threading.Lock()
+
+
+def get_known_service_definitions() -> list[_ServiceDefinition]:
+    """
+    Return all service definitions observed in the current Python process.
+
+    This cache records every decorated service class at import time so future
+    app/worker startups can reuse definitions for modules that were already
+    imported explicitly, without forcing another package scan or import.
+    """
+    return _KNOWN_SERVICE_REGISTRY.definitions()
 
 
 def get_global_service_definitions() -> list[_ServiceDefinition]:
@@ -292,6 +306,16 @@ def _register_definition_into_runtime_registries(
 
     if not matched and maintain_global:
         _GLOBAL_SERVICE_REGISTRY.register(definition)
+
+
+def register_known_service_definitions_for_package_paths(
+    registry: AppServiceRegistry,
+    *,
+    package_paths: Sequence[str],
+) -> None:
+    for definition in get_known_service_definitions():
+        if _definition_matches_package_paths(definition, package_paths):
+            registry.register(definition)
 
 
 def Require(
@@ -425,6 +449,7 @@ def _register_service_class(
         exposed_type=exposed_type,
     )
     setattr(service_cls, SERVICE_DEFINITION_ATTR, definition)
+    _KNOWN_SERVICE_REGISTRY.register(definition)
     _register_definition_into_active_registry(definition)
     _register_definition_into_runtime_registries(definition)
     return service_cls

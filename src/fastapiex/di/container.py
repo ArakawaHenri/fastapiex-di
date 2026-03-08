@@ -527,7 +527,7 @@ class ServiceContainer:
         internal_id = self._key_index.get(key)
         if internal_id is None:
             msg = f"Requesting unregistered service: {key}"
-            logger.error(msg)
+            logger.debug(msg)
             raise UnregisteredServiceByKeyError(msg)
         return self._services[internal_id]
 
@@ -542,7 +542,7 @@ class ServiceContainer:
         ids = self._type_index.get(service_type)
         if not ids:
             msg = f"No service registered for type: {service_type!r}"
-            logger.error(msg)
+            logger.debug(msg)
             raise UnregisteredServiceByTypeError(msg)
         if len(ids) > 1:
             msg = (

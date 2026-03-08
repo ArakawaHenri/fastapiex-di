@@ -160,7 +160,7 @@ def _expand_definitions(
                 f"Service definition '{definition.origin}' has dict source but no key template."
             )
 
-        source_mapping = _resolve_source(definition.source)
+        source_mapping = dict(_resolve_source(definition.source))
         for raw_dict_key, raw_value in source_mapping.items():
             dict_key = str(raw_dict_key)
             service_key = _render_service_key(definition.key_template, dict_key)
@@ -333,6 +333,7 @@ def _resolve_dependency_targets(
             _CompiledService(
                 origin=definition.origin,
                 internal_id=internal_id,
+                registration_id=registration_key if registration_key is not None else definition.origin,
                 key=registration_key,
                 lifetime=definition.lifetime,
                 eager=definition.eager,

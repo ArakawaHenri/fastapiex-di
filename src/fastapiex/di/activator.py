@@ -98,13 +98,17 @@ def _make_bound_ctor(container: ServiceContainer, spec: _CompiledService) -> Cto
 
 def _select_unregistered_specs(
     plan: Sequence[_CompiledService],
-    registered_origins: set[str],
+    registered_service_ids: set[str],
 ) -> list[_CompiledService]:
-    return [spec for spec in plan if spec.origin not in registered_origins]
+    return [
+        spec for spec in plan
+        if spec.registration_id not in registered_service_ids
+    ]
 
 
 def _registered_service_from_spec(spec: _CompiledService) -> RegisteredService:
     return RegisteredService(
+        registration_id=spec.registration_id,
         key=spec.key,
         origin=spec.origin,
         service_type=spec.service_type,
@@ -133,7 +137,7 @@ async def _register_compiled_specs(
     specs: Sequence[_CompiledService],
     *,
     eager_init_timeout_sec: float | None = None,
-    registered_origins: set[str] | None = None,
+    registered_service_ids: set[str] | None = None,
 ) -> list[RegisteredService]:
     registered_services: list[RegisteredService] = []
     for spec in specs:
@@ -150,8 +154,8 @@ async def _register_compiled_specs(
                 eager_init_timeout_sec=eager_init_timeout_sec,
             )
         registered_services.append(_registered_service_from_spec(spec))
-        if registered_origins is not None:
-            registered_origins.add(spec.origin)
+        if registered_service_ids is not None:
+            registered_service_ids.add(spec.registration_id)
     return registered_services
 
 
@@ -190,7 +194,7 @@ async def refresh_services_for_container(
     container: ServiceContainer,
     *,
     registry: AppServiceRegistry,
-    registered_origins: set[str],
+    registered_service_ids: set[str],
     include_global_registry: bool,
     eager_init_timeout_sec: float | None = None,
 ) -> list[RegisteredService]:
@@ -205,7 +209,7 @@ async def refresh_services_for_container(
         include_global_registry=include_global_registry,
     )
     plan = build_service_plan(registry=registry)
-    new_specs = _select_unregistered_specs(plan, registered_origins)
+    new_specs = _select_unregistered_specs(plan, registered_service_ids)
     if not new_specs:
         return []
 
@@ -213,7 +217,7 @@ async def refresh_services_for_container(
         container,
         new_specs,
         eager_init_timeout_sec=eager_init_timeout_sec,
-        registered_origins=registered_origins,
+        registered_service_ids=registered_service_ids,
     )
     logger.debug(
         "[LIFESPAN] Runtime refresh registered services count=%s",

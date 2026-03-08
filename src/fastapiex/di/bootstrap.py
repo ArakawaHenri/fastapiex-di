@@ -13,6 +13,7 @@ from .activator import register_services_from_registry
 from .constants import (
     APP_STATE_DI_CONFIG_ATTR,
     APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR,
+    APP_STATE_DI_REGISTERED_SERVICE_IDS_ATTR,
     APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR,
     APP_STATE_DI_SERVICE_REGISTRY_ATTR,
 )
@@ -28,6 +29,7 @@ from .registry import (
     AppServiceRegistry,
     capture_service_registrations,
     get_global_service_definitions,
+    register_known_service_definitions_for_package_paths,
     register_runtime_registry_binding,
     unregister_runtime_registry_binding,
 )
@@ -85,15 +87,19 @@ def _initialize_runtime_app_state(
     app: FastAPI,
     *,
     app_service_registry: AppServiceRegistry,
-) -> None:
+) -> asyncio.Lock:
+    refresh_lock = asyncio.Lock()
     setattr(app.state, APP_STATE_DI_SERVICE_REGISTRY_ATTR, app_service_registry)
     setattr(app.state, APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR, set())
-    setattr(app.state, APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR, asyncio.Lock())
+    setattr(app.state, APP_STATE_DI_REGISTERED_SERVICE_IDS_ATTR, set())
+    setattr(app.state, APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR, refresh_lock)
+    return refresh_lock
 
 
 def _clear_runtime_app_state(app: FastAPI) -> None:
     setattr(app.state, APP_STATE_DI_SERVICE_REGISTRY_ATTR, None)
     setattr(app.state, APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR, set())
+    setattr(app.state, APP_STATE_DI_REGISTERED_SERVICE_IDS_ATTR, set())
     setattr(app.state, APP_STATE_DI_GLOBAL_REFRESH_LOCK_ATTR, None)
 
 
@@ -114,6 +120,10 @@ def _load_registry_definitions(
         app_service_registry,
         imported_modules,
         include_packages=config.service_package_imports,
+    )
+    register_known_service_definitions_for_package_paths(
+        app_service_registry,
+        package_paths=config.service_packages,
     )
 
 
@@ -180,6 +190,7 @@ def install_di(
         services: ServiceContainer | None = None
         sc_registry: ServiceContainerRegistry | None = None
         app_service_registry: AppServiceRegistry | None = None
+        refresh_lock: asyncio.Lock | None = None
         binding_registered = False
         runtime_config = config
 
@@ -195,7 +206,7 @@ def install_di(
                     setattr(inner_app.state, APP_STATE_DI_CONFIG_ATTR, runtime_config)
 
                 app_service_registry = _build_app_service_registry(runtime_config)
-                _initialize_runtime_app_state(
+                refresh_lock = _initialize_runtime_app_state(
                     inner_app,
                     app_service_registry=app_service_registry,
                 )
@@ -216,9 +227,23 @@ def install_di(
                     registry=app_service_registry,
                     eager_init_timeout_sec=runtime_config.eager_init_timeout_sec,
                 )
+                registered_service_ids = {
+                    item.registration_id for item in registered_services
+                }
                 setattr(inner_app.state, APP_STATE_DI_REGISTERED_SERVICE_ORIGINS_ATTR, {
                     item.origin for item in registered_services
                 })
+                setattr(
+                    inner_app.state,
+                    APP_STATE_DI_REGISTERED_SERVICE_IDS_ATTR,
+                    registered_service_ids,
+                )
+                if refresh_lock is not None:
+                    sc_registry.bind_current_runtime_state(
+                        service_registry=app_service_registry,
+                        registered_service_ids=registered_service_ids,
+                        refresh_lock=refresh_lock,
+                    )
 
             except Exception:
                 if config.strict:

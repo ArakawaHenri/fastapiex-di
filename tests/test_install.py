@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import importlib
+import logging
+import sys
+import threading
+import types
+import uuid
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +20,37 @@ from starlette.websockets import WebSocketDisconnect
 from fastapiex.di import Inject, ServiceLifetime, install_di
 from fastapiex.di.injection import resolve_service_container
 from tests.di_test_services.helpers import set_order_sink
+
+
+def _import_or_reload(module_name: str) -> None:
+    module = sys.modules.get(module_name)
+    if module is None:
+        importlib.import_module(module_name)
+        return
+    importlib.reload(module)
+
+
+def _register_dynamic_private_service(
+    *,
+    module_name: str,
+    service_key: str,
+    payload: str,
+) -> None:
+    module = types.ModuleType(module_name)
+    module.__file__ = f"/Users/henri/Code/fastapiex-di/tests/di_test_services/{module_name.rsplit('.', 1)[-1]}.py"
+    module.__package__ = "tests.di_test_services"
+    sys.modules[module_name] = module
+    exec(
+        (
+            "from fastapiex.di import BaseService, Service\n"
+            f"@Service({service_key!r})\n"
+            "class DynamicPrivateService(BaseService):\n"
+            "    @classmethod\n"
+            "    async def create(cls) -> dict[str, str]:\n"
+            f"        return {{'scope': {payload!r}}}\n"
+        ),
+        module.__dict__,
+    )
 
 
 def test_install_di_wires_injection_and_allows_runtime_registration() -> None:
@@ -540,11 +578,162 @@ def test_install_di_refresh_registers_late_private_service_without_global_regist
         return {"ok": True}
 
     with TestClient(app) as client:
-        import tests.di_test_services._late_private  # noqa: F401
+        _import_or_reload("tests.di_test_services._late_private")
 
         response = client.get("/late-private")
         assert response.status_code == 200
         assert response.json() == {"ok": True}
+
+
+def test_install_di_late_refresh_does_not_emit_error_log(caplog: pytest.LogCaptureFixture) -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=False,
+    )
+
+    @app.get("/late-private-log")
+    async def resolve_late_private(_svc=Inject("late_private_service")):
+        return {"ok": True}
+
+    with caplog.at_level(logging.ERROR, logger="fastapiex.di.container"):
+        with TestClient(app) as client:
+            _import_or_reload("tests.di_test_services._late_private")
+
+            response = client.get("/late-private-log")
+            assert response.status_code == 200
+            assert response.json() == {"ok": True}
+
+    assert "Requesting unregistered service: late_private_service" not in caplog.text
+
+
+def test_install_di_shared_app_worker_contexts_refresh_independently() -> None:
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=False,
+    )
+
+    dependency = Inject("late_private_service").dependency
+    assert dependency is not None
+
+    ready = threading.Barrier(3)
+    first_done = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    results: dict[str, dict[str, str]] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _build_request() -> Request:
+        return Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "path": "/late-private",
+                "raw_path": b"/late-private",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "state": {},
+                "app": app,
+            }
+        )
+
+    def _worker(name: str, gate: threading.Event) -> None:
+        async def _run() -> None:
+            async with app.router.lifespan_context(app):
+                await asyncio.to_thread(ready.wait)
+                await asyncio.to_thread(gate.wait)
+                result = await dependency(_build_request())
+                results[name] = cast(dict[str, str], result)
+                if name == "first":
+                    first_done.set()
+
+        try:
+            asyncio.run(_run())
+        except BaseException as exc:  # pragma: no cover - exercised on regression
+            errors[name] = exc
+            if name == "first":
+                first_done.set()
+
+    first = threading.Thread(target=_worker, args=("first", release_first))
+    second = threading.Thread(target=_worker, args=("second", release_second))
+    first.start()
+    second.start()
+
+    ready.wait()
+    _import_or_reload("tests.di_test_services._late_private")
+
+    release_first.set()
+    assert first_done.wait(timeout=5)
+    release_second.set()
+
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert errors == {}
+    assert results == {
+        "first": {"scope": "private"},
+        "second": {"scope": "private"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_global_service_registry", [False, True])
+async def test_install_di_later_worker_startup_reuses_explicitly_imported_private_service(
+    use_global_service_registry: bool,
+) -> None:
+    suffix = uuid.uuid4().hex
+    module_name = f"tests.di_test_services._dynamic_private_{suffix}"
+    service_key = f"dynamic_private_service_{suffix}"
+
+    app = FastAPI()
+    install_di(
+        app,
+        service_packages=["tests.di_test_services"],
+        use_global_service_registry=use_global_service_registry,
+        allow_private_modules=False,
+    )
+
+    dependency = Inject(service_key).dependency
+    assert dependency is not None
+
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/dynamic-private",
+            "raw_path": b"/dynamic-private",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "state": {},
+            "app": app,
+        }
+    )
+
+    async with app.router.lifespan_context(app):
+        _register_dynamic_private_service(
+            module_name=module_name,
+            service_key=service_key,
+            payload="dynamic-private",
+        )
+        payload = await dependency(request)
+        assert payload == {"scope": "dynamic-private"}
+
+    async with app.router.lifespan_context(app):
+        payload = await dependency(request)
+        assert payload == {"scope": "dynamic-private"}
 
 
 def test_install_di_global_registry_true_refreshes_after_startup_late_import() -> None:
