@@ -13,7 +13,7 @@ jobs:
       contents: read
     steps:
       - name: Dependency review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
 
   supply-chain:
     runs-on: ubuntu-latest
