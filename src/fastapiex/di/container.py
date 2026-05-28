@@ -24,6 +24,7 @@ from contextlib import (
 )
 from typing import (
     Annotated,
+    Union,
     cast,
     get_args,
     get_origin,
@@ -373,7 +374,7 @@ class ServiceContainer:
         origin = get_origin(ann)
 
         # Unwrap Optional[T] / Union[T, None] / T | None → T
-        if origin is types.UnionType:
+        if origin is types.UnionType or origin is Union:
             u_args = [a for a in get_args(ann) if a is not type(None)]
             if len(u_args) == 1:
                 ann = u_args[0]

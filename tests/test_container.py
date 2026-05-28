@@ -7,7 +7,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Optional, Union, cast
 
 import pytest
 from fastapi import FastAPI
@@ -222,6 +222,40 @@ async def test_type_based_injection():
         return MyService()
 
     # Anonymous registration (accessible only by type)
+    await container.register(None, ServiceLifetime.SINGLETON, factory, None)
+
+    instance = await container.aget_by_type(MyService)
+    assert isinstance(instance, MyService)
+    assert instance.value == 42
+
+
+@pytest.mark.asyncio
+async def test_anonymous_optional_return_annotation_resolves_inner_type() -> None:
+    container = ServiceContainer()
+
+    class MyService:
+        value: int = 42
+
+    async def factory() -> Optional[MyService]:
+        return MyService()
+
+    await container.register(None, ServiceLifetime.SINGLETON, factory, None)
+
+    instance = await container.aget_by_type(MyService)
+    assert isinstance(instance, MyService)
+    assert instance.value == 42
+
+
+@pytest.mark.asyncio
+async def test_anonymous_typing_union_return_annotation_resolves_inner_type() -> None:
+    container = ServiceContainer()
+
+    class MyService:
+        value: int = 42
+
+    async def factory() -> Union[MyService, None]:
+        return MyService()
+
     await container.register(None, ServiceLifetime.SINGLETON, factory, None)
 
     instance = await container.aget_by_type(MyService)
