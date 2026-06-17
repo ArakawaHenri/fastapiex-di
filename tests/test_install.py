@@ -37,7 +37,8 @@ def _register_dynamic_private_service(
     payload: str,
 ) -> None:
     module = types.ModuleType(module_name)
-    module.__file__ = f"/Users/henri/Code/fastapiex-di/tests/di_test_services/{module_name.rsplit('.', 1)[-1]}.py"
+    module_file_name = f"{module_name.rsplit('.', 1)[-1]}.py"
+    module.__file__ = str((Path(__file__).parent / "di_test_services" / module_file_name).resolve())
     module.__package__ = "tests.di_test_services"
     sys.modules[module_name] = module
     exec(
