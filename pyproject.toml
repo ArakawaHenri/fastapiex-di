@@ -37,7 +37,7 @@ Security = "https://github.com/ArakawaHenri/fastapiex-di/blob/main/SECURITY.md"
 
 [dependency-groups]
 dev = [
-  "httpx>=0.28.0",
+  "httpx2>=2.4.0",
   "mypy>=1.11.0",
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
